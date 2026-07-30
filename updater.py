@@ -38,11 +38,11 @@ def calc_price(cost, weight):
     # PROFIT MARGIN (converted properly)
     # -----------------------------
     if cost < 5:
-        margin = 0.3   # was 0.5 → now 30% profit
+        margin = 0.30   # was 0.5 → now 30% profit
     elif cost < 10:
-        margin = 0.2   # was 0.3 → now 20%
+        margin = 0.25   # was 0.3 → now 20%
     else:
-        margin = 0.1   # was 0.2 → now 10%
+        margin = 0.20   # was 0.2 → now 10%
 
     # -----------------------------
     # CONSTANTS
