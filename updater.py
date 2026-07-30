@@ -6,105 +6,10 @@ import os
 # -----------------------------
 # CONFIG
 # -----------------------------
-# Environment variables
-SHOP_URL = os.getenv("SHOP_URL")  # e.g. "xxxxx.myshopify.com"
-CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID")
-CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET")
+SHOP_URL = os.getenv("SHOP_URL")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+XML_URL = os.getenv("XML_URL") 
 API_VERSION = "2024-01"
-
-# In-memory token cache
-_token_cache = {
-    "access_token": None,
-    "expires_at": 0
-}
-
-
-def get_access_token():
-    """Fetch and cache Shopify access token (24h expiry)."""
-    global _token_cache
-
-    # Reuse token if still valid
-    if (
-        _token_cache["access_token"]
-        and time.time() < _token_cache["expires_at"]
-    ):
-        return _token_cache["access_token"]
-
-    # Request new token
-    response = requests.post(
-        f"https://{SHOP_URL}/admin/oauth/access_token",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={
-            "grant_type": "client_credentials",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        },
-        timeout=30,
-    )
-
-    response.raise_for_status()
-    data = response.json()
-
-    access_token = data.get("access_token")
-    if not access_token:
-        raise Exception(f"Failed to retrieve access token: {data}")
-
-    # Shopify tokens expire in 24 hours
-    expires_in = 86400  # seconds
-
-    _token_cache["access_token"] = access_token
-    _token_cache["expires_at"] = time.time() + expires_in - 60  # refresh 1 min early
-
-    return access_token
-
-
-def shopify_request(method, endpoint, **kwargs):
-    """
-    Make a Shopify API request with automatic token handling and retry.
-    endpoint: e.g. "products.json"
-    """
-    global _token_cache
-
-    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/{endpoint}"
-
-    # First attempt
-    token = get_access_token()
-    headers = kwargs.pop("headers", {})
-    headers["X-Shopify-Access-Token"] = token
-
-    response = requests.request(
-        method,
-        url,
-        headers=headers,
-        timeout=30,
-        **kwargs
-    )
-
-    # If unauthorized → refresh token and retry once
-    if response.status_code == 401:
-        _token_cache["access_token"] = None  # force refresh
-
-        token = get_access_token()
-        headers["X-Shopify-Access-Token"] = token
-
-        response = requests.request(
-            method,
-            url,
-            headers=headers,
-            timeout=30,
-            **kwargs
-        )
-
-    return response
-
-# Example usage
-if __name__ == "__main__":
-    res = shopify_request("GET", "products.json")
-
-    if res.ok:
-        print(res.json())
-    else:
-        print(f"Error {res.status_code}: {res.text}")
  
 LIMIT = 10
  
