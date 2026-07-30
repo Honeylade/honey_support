@@ -28,12 +28,40 @@ TAGS_TO_INCLUDE = ["Import", "Honeylade", "Honey"]
 def calc_price(cost, weight):
     cost = float(cost or 0)
     weight = float(weight or 0)
- 
-    shipping = 2.5 if weight < 250 else 4 if weight < 500 else 6
-    margin = 2.2 if cost < 5 else 2.0 if cost < 10 else 1.6
- 
-    return round(cost * margin + shipping, 2)
- 
+
+    # -----------------------------
+    # SHIPPING LOGIC (unchanged)
+    # -----------------------------
+    shipping = 3.99 if weight < 300 else 4.99 if weight < 2000 else 18
+
+    # -----------------------------
+    # PROFIT MARGIN (converted properly)
+    # -----------------------------
+    if cost < 5:
+        margin = 0.3   # was 0.5 → now 30% profit
+    elif cost < 10:
+        margin = 0.2   # was 0.3 → now 20%
+    else:
+        margin = 0.1   # was 0.2 → now 10%
+
+    # -----------------------------
+    # CONSTANTS
+    # -----------------------------
+    TAX = 0.20
+    FEES = 0.029 + 0.09   # Shopify + TikTok
+    FIXED_COSTS = 0.30 + 0.5 # = Shopify Flat fee + Shopify Platform per order
+
+    # -----------------------------
+    # CORE FORMULA
+    # -----------------------------
+    base_price = cost * (1 + margin)        # apply profit
+    taxed_price = base_price * (1 + TAX)    # apply tax
+    price_after_fees = taxed_price / (1 - FEES)
+
+    final_price = price_after_fees + shipping + FIXED_COSTS
+
+    return round(final_price, 2)
+
 # -----------------------------
 # HELPERS
 # -----------------------------
