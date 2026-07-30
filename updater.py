@@ -48,8 +48,8 @@ def calc_price(cost, weight):
     # CONSTANTS
     # -----------------------------
     TAX = 0.20
-    FEES = 0.029 + 0.09   # Shopify + TikTok
-    FIXED_COSTS = 0.30 + 0.5 # = Shopify Flat fee + Shopify Platform per order
+    FEES = 0.029 + 0.090   # Shopify + TikTok
+    FIXED_COSTS = 0.30 + 0.50 # = Shopify Flat fee + Shopify Platform per order
 
     # -----------------------------
     # CORE FORMULA
