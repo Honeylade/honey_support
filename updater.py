@@ -11,7 +11,7 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 XML_URL = os.getenv("XML_URL") 
 API_VERSION = "2024-01"
  
-LIMIT = 10
+LIMIT = 20
  
 HEADERS = {
     "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -19,7 +19,7 @@ HEADERS = {
     "Accept": "application/json"
 }
  
-TAGS_TO_INCLUDE = ["Import", "Honeylade", "Honey"]
+TAGS_TO_INCLUDE = ["football accessories", "Honeylade", "Honey"]
  
 # -----------------------------
 # PRICE LOGIC
