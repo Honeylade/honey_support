@@ -1,5 +1,5 @@
 import requests
-from lxml import etree  # ✅ FIX: robust XML parser
+import xml.etree.ElementTree as ET
 import re
 import os
 import sys
@@ -7,11 +7,11 @@ import sys
 # -----------------------------
 # CONFIG
 # -----------------------------
-SHOP_URL = (os.getenv("SHOP_URL") or "").strip()
-ACCESS_TOKEN = (os.getenv("ACCESS_TOKEN") or "").strip()
-XML_URL = (os.getenv("XML_URL") or "").strip()
-API_VERSION = "2024-01"
+SHOP_URL = os.getenv("SHOP_URL")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+XML_URL = os.getenv("XML_URL")
 
+API_VERSION = "2024-01"
 LIMIT = 40
 
 HEADERS = {
@@ -23,28 +23,30 @@ HEADERS = {
 TAGS_TO_INCLUDE = ["football accessories", "Honeylade", "Honey"]
 
 # -----------------------------
-# VALIDATION (NEW)
+# 🔐 TOKEN VALIDATION
 # -----------------------------
-def validate_connection():
-    print("🔐 Validating Shopify connection...")
-    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/shop.json"
+def validate_token():
+    print("🔐 Validating Shopify token...")
 
+    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/shop.json"
     r = requests.get(url, headers=HEADERS)
 
     if r.status_code == 200:
-        print("✅ Connected to Shopify store")
-    elif r.status_code == 401:
-        print("❌ Invalid token (401)")
-        sys.exit(1)
-    elif r.status_code == 403:
-        print("❌ Missing permissions (403)")
-        sys.exit(1)
+        shop_name = r.json().get("shop", {}).get("name")
+        print(f"✅ Token valid. Connected to: {shop_name}")
+        return True
     else:
-        print(f"❌ Shopify error: {r.status_code} {r.text}")
+        print("❌ INVALID TOKEN")
+        print("Status:", r.status_code)
+        print("Response:", r.text)
+        print("\n👉 Fix this:")
+        print("- Use Admin API access token (not Storefront)")
+        print("- Or ensure your atkn_ token has Admin API scopes")
+        print("- Required scopes: write_products, read_products")
         sys.exit(1)
 
 # -----------------------------
-# PRICE LOGIC (unchanged)
+# PRICE LOGIC
 # -----------------------------
 def calc_price(cost, weight):
     cost = float(cost or 0)
@@ -71,13 +73,12 @@ def calc_price(cost, weight):
     return round(final_price, 2)
 
 # -----------------------------
-# HELPERS (unchanged)
+# HELPERS
 # -----------------------------
 def last_value(val):
     if not val:
         return ""
-    v = val.split(">")[-1].strip()
-    return v.replace("&amp;", "and").replace("&", "and")
+    return val.split(">")[-1].strip().replace("&", "and")
 
 def split_tags(val):
     if not val:
@@ -85,65 +86,66 @@ def split_tags(val):
     return [t.strip() for t in re.split(r"[>\|,;/\s]+", val) if t.strip()]
 
 def sanitize_tags(tags):
-    sanitized = []
     seen = set()
-    for tag in tags:
-        if not tag:
-            continue
-        t = tag.replace('&', 'and').strip()
-        if len(t) > 255:
-            t = t[:255]
-        if t.lower() not in seen:
+    result = []
+    for t in tags:
+        t = t.replace("&", "and").strip()
+        if t and t.lower() not in seen:
             seen.add(t.lower())
-            sanitized.append(t)
-    return sanitized
+            result.append(t[:255])
+    return result
 
 def build_description(p):
-    bullets = []
-    for i in range(1, 11):
-        v = p.get(f"desc_{i}")
-        if v:
-            bullets.append(f"<li>{v}</li>")
-    bullet_html = f"<ul>{''.join(bullets)}</ul>" if bullets else ""
-    paragraph = f"<p>{p.get('desc_standard','') or ''}</p>"
-    return bullet_html + paragraph
+    bullets = [
+        f"<li>{p.get(f'desc_{i}')}</li>"
+        for i in range(1, 11)
+        if p.get(f"desc_{i}")
+    ]
+    return f"<ul>{''.join(bullets)}</ul><p>{p.get('desc_standard','')}</p>"
 
 # -----------------------------
-# IMAGE VALIDATION (unchanged)
+# IMAGE VALIDATION
 # -----------------------------
 def valid_image(url):
     if not url:
         return False
-    url = url.strip()
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return False
-    if " " in url:
-        return False
-    if not any(ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-        return False
-    return True
+    url = url.strip().lower()
+    return (
+        url.startswith("http")
+        and " " not in url
+        and any(ext in url for ext in [".jpg", ".jpeg", ".png", ".webp"])
+    )
 
 # -----------------------------
-# SHOPIFY WRAPPERS (unchanged)
+# SHOPIFY WRAPPERS
 # -----------------------------
 def shopify_get(url, params=None):
     r = requests.get(url, headers=HEADERS, params=params)
-    return r.json() if r.status_code == 200 else {}
+    if r.status_code == 401:
+        print("❌ AUTH ERROR DURING GET")
+        sys.exit(1)
+    return r.json() if r.ok else {}
 
 def shopify_post(url, data):
     r = requests.post(url, headers=HEADERS, json=data)
-    if r.status_code not in [200, 201]:
+    if r.status_code == 401:
+        print("❌ AUTH ERROR DURING POST")
+        sys.exit(1)
+    if not r.ok:
         print("❌ POST ERROR:", r.status_code, r.text)
     return r.json() if r.text else {}
 
 def shopify_put(url, data):
     r = requests.put(url, headers=HEADERS, json=data)
-    if r.status_code not in [200, 201]:
+    if r.status_code == 401:
+        print("❌ AUTH ERROR DURING PUT")
+        sys.exit(1)
+    if not r.ok:
         print("❌ PUT ERROR:", r.status_code, r.text)
     return r.json() if r.text else {}
 
 # -----------------------------
-# SAFE FIND (unchanged)
+# FIND PRODUCT
 # -----------------------------
 def find_product_by_handle(handle):
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
@@ -151,23 +153,16 @@ def find_product_by_handle(handle):
     return (res.get("products") or [None])[0]
 
 # -----------------------------
-# BUILD PRODUCT (FIX: title fallback)
+# BUILD PRODUCT
 # -----------------------------
 def build_product(p):
-    title = p.get("title")
-
-    # 🚨 FIX: ensure title is never empty
-    if not title:
-        title = f"Product-{p.get('sku')}"
-
+    title = p.get("title") or f"Product-{p.get('sku')}"
     handle = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
 
     cost = float(p.get("costprice") or 0)
     weight = float(p.get("weight") or 0)
-    price = calc_price(cost, weight)
 
-    vendor = last_value(p.get("productbrand"))
-    product_type = last_value(p.get("productrange"))
+    price = calc_price(cost, weight)
 
     tags = sanitize_tags(
         split_tags(p.get("productbrand")) +
@@ -176,52 +171,48 @@ def build_product(p):
         split_tags(title)
     )
 
-    description = build_description(p)
+    images = [
+        {"src": img.strip()}
+        for img in re.split(r"[|,]+", p.get("imageoffloads") or "")
+        if valid_image(img)
+    ]
 
-    images = []
-    for img in re.split(r"[|,]+", (p.get("imageoffloads") or "")):
-        if valid_image(img):
-            images.append({"src": img.strip()})
+    variant = {
+        "price": price,
+        "sku": p.get("sku"),
+        "inventory_quantity": int(p.get("stock") or 0),
+        "inventory_management": "shopify",
+        "weight": weight,
+        "weight_unit": "g"
+    }
 
     return {
         "title": title,
-        "body_html": description,
-        "vendor": vendor,
-        "product_type": product_type,
+        "body_html": build_description(p),
         "tags": ", ".join(tags),
         "handle": handle,
         "status": "active",
-        "published": True,
-        "variants": [{
-            "price": price,
-            "sku": p.get("sku"),
-            "inventory_management": "shopify"
-        }],
+        "variants": [variant],
         **({"images": images} if images else {})
     }
 
 # -----------------------------
-# LOAD XML (FIXED)
+# LOAD XML
 # -----------------------------
 def load_xml():
     print("📥 Downloading XML...")
     r = requests.get(XML_URL)
     r.raise_for_status()
 
-    parser = etree.XMLParser(recover=True)  # ✅ FIX
-    root = etree.fromstring(r.content, parser)
-
+    root = ET.fromstring(r.content)
     items = root.findall(".//post")
+
     print(f"🔎 Found {len(items)} items")
 
-    products = []
-    for item in items[:LIMIT]:
-        data = {}
-        for c in item:
-            data[c.tag.lower()] = c.text
-        products.append(data)
-
-    return products
+    return [
+        {c.tag.lower(): c.text for c in item}
+        for item in items[:LIMIT]
+    ]
 
 # -----------------------------
 # SYNC
@@ -229,33 +220,26 @@ def load_xml():
 def run_sync():
     print("🚀 START SYNC")
 
-    validate_connection()  # ✅ FIX
+    validate_token()   # ✅ NEW
 
     items = load_xml()
 
+    created = 0
+
     for p in items:
-        payload = build_product(p)
-        handle = payload["handle"]
+        product_payload = build_product(p)
 
-        existing = find_product_by_handle(handle)
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+        res = shopify_post(url, {"product": product_payload})
 
-        if existing:
-            shopify_put(
-                f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json",
-                {"product": payload}
-            )
-            print(f"🔄 Updated: {payload['title']}")
+        if res.get("product"):
+            created += 1
+            print(f"🆕 Created: {product_payload['title']}")
         else:
-            res = shopify_post(
-                f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json",
-                {"product": payload}
-            )
-            if res.get("product"):
-                print(f"🆕 Created: {payload['title']}")
-            else:
-                print(f"❌ Failed: {payload['title']}")
+            print(f"❌ Failed: {product_payload['title']}")
 
     print("✅ DONE")
+    print(f"Created: {created}")
 
 # -----------------------------
 # RUN
