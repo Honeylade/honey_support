@@ -11,7 +11,7 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 XML_URL = os.getenv("XML_URL") 
 API_VERSION = "2024-01"
  
-LIMIT = 40
+LIMIT = 4
  
 HEADERS = {
     "X-Shopify-Access-Token": ACCESS_TOKEN,
