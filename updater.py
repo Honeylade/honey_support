@@ -68,7 +68,7 @@ def last_value(val):
     if not val:
         return ""
     v = val.split(">")[-1].strip()
-    return v.replace("&amp;", "and").replace("&amp", "and")
+    return v.replace("&amp;", "and").replace("&", "and")
  
 def split_tags(val):
     if not val:
