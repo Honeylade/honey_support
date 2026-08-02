@@ -11,7 +11,7 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 XML_URL = os.getenv("XML_URL") 
 API_VERSION = "2024-01"
  
-LIMIT = 20
+LIMIT = 30
  
 HEADERS = {
     "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -68,7 +68,7 @@ def last_value(val):
     if not val:
         return ""
     v = val.split(">")[-1].strip()
-    return v.replace("&amp;", "and").replace("&", "and")
+    return v.replace("&amp;", "and").replace("&amp", "and")
  
 def split_tags(val):
     if not val:
