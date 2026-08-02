@@ -28,7 +28,7 @@ HEADERS = {
     "Accept": "application/json"
 }
  
-TAGS_TO_INCLUDE = ["football accessories", "Honeylade", "Honey"]
+TAGS_TO_INCLUDE = ["football accessories", "themed gifts", "Honeylade", "sports gifts", "fan accessories", "novelty gifts", "sports fans"]
  
 # -----------------------------
 # PRICE LOGIC
