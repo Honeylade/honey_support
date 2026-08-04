@@ -243,39 +243,72 @@ def load_xml():
     print("📥 Downloading XML...")
     r = requests.get(XML_URL)
     r.raise_for_status()
-    raw = r.content.decode('utf-8', errors='replace')
+    raw_bytes = r.content
+    raw = raw_bytes.decode('utf-8', errors='replace')
  
-    # First, try direct parse
+    # Save raw feed for inspection
+    try:
+        with open("feed_debug.xml", "wb") as f:
+            f.write(raw_bytes)
+        print("ℹ️ Saved raw feed to feed_debug.xml")
+    except Exception as e:
+        print("⚠️ Couldn't save raw feed:", e)
+ 
+    # Try parse, on failure give helpful debug info and attempts to repair
     try:
         root = ET.fromstring(raw)
-        items = root.findall(".//post")
-        print(f"🔎 Found {len(items)} items (parsed cleanly)")
     except ParseError as e:
-        # Log parser error and attempt auto-fixes
         print("⚠️ XML ParseError:", e)
-        # Attempt simple ampersand fix
-        fixed = _escape_unescaped_amp(raw)
+        # extract line/col if available
+        msg = str(e)
+        m = re.search(r"line (\d+), column (\d+)", msg)
+        if m:
+            err_line = int(m.group(1))
+            err_col = int(m.group(2))
+            print(f"🔎 Error at line {err_line}, column {err_col}. Showing context:")
+            lines = raw.splitlines()
+            start = max(0, err_line - 6)
+            end = min(len(lines), err_line + 4)
+            for i in range(start, end):
+                indicator = ">>" if (i + 1) == err_line else "  "
+                print(f"{indicator} {i+1:04d}: {lines[i]}")
+        else:
+            print("🔎 Could not extract line/column from error message.")
+ 
+        # Attempt 1: escape unescaped ampersands (already in your script)
+        fixed = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;)', '&amp;', raw)
+ 
+        # Attempt 2: common stray tag fixes: convert lone <br> to <br/> and close obvious opened tags like <p>, <div>, <span>
+        fixed = re.sub(r"<br\s*>", "<br/>", fixed, flags=re.IGNORECASE)
+        # heuristic: close unclosed simple tags if they appear to be left open at the same line (best-effort)
+        # Note: this is intentionally conservative and won't attempt deep HTML repairs
+        fixed = re.sub(r"<(/?)(div|span|p)[^>]*>(?![\s\S]*</\2>)", lambda m: m.group(0) if m.group(1) == "/" else m.group(0) + f"</{m.group(2)}>", fixed, flags=re.IGNORECASE)
+ 
+        # Try parse the fixed text
         try:
             root = ET.fromstring(fixed)
-            items = root.findall(".//post")
-            print(f"🔎 Found {len(items)} items (after &-escape fix)")
+            print("✅ Parsed after heuristic fixes (ampersand/BR/tag).")
+            raw = fixed
         except ParseError as e2:
-            print("⚠️ Still ParseError after &-escape:", e2)
-            # If BeautifulSoup is available, try to repair and reserialize
+            print("⚠️ Still ParseError after heuristic fixes:", e2)
+            # Try BeautifulSoup if available
             if _HAS_BS4:
-                print("ℹ️ Attempting to repair XML with BeautifulSoup...")
+                print("ℹ️ Attempting repair with BeautifulSoup (xml parser)...")
                 soup = BeautifulSoup(raw, "xml")
                 repaired = str(soup)
                 try:
                     root = ET.fromstring(repaired)
-                    items = root.findall(".//post")
-                    print(f"🔎 Found {len(items)} items (after BeautifulSoup repair)")
+                    raw = repaired
+                    print("✅ Parsed after BeautifulSoup repair.")
                 except ParseError as e3:
-                    print("❌ Failed to parse even after BeautifulSoup repair:", e3)
+                    print("❌ Failed to parse even after BeautifulSoup:", e3)
                     raise
             else:
-                print("❌ No BeautifulSoup available to attempt repair. Enable bs4 or fix feed upstream.")
+                print("❌ No BeautifulSoup available to attempt repair. Install with: pip install beautifulsoup4")
                 raise
+ 
+    items = root.findall(".//post")
+    print(f"🔎 Found {len(items)} items")
  
     products = []
     for item in items[:LIMIT]:
