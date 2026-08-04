@@ -1,4 +1,4 @@
-name: Shopify XML Sync
+name: Honey Sync
 
 on:
   schedule:
@@ -26,7 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Shopify sync script
+      - name: Run Honey sync script
         env:
           SHOP_URL: ${{ secrets.SHOP_URL }}
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
