@@ -59,7 +59,6 @@ def calc_price(cost, weight):
  
 # -----------------------------
 # HELPERS
-# (unchanged)
 # -----------------------------
 def last_value(val):
     if not val:
@@ -108,6 +107,9 @@ def valid_image(url):
         return False
     return True
  
+# -----------------------------
+# SHOPIFY WRAPPERS
+# -----------------------------
 def shopify_get(url, params=None):
     r = requests.get(url, headers=HEADERS, params=params)
     try:
@@ -133,6 +135,9 @@ def shopify_put(url, data):
     except ValueError:
         return {}
  
+# -----------------------------
+# FIND PRODUCT (safe)
+# -----------------------------
 def find_product_by_handle(handle):
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
     res = shopify_get(url, {"handle": handle})
@@ -147,7 +152,6 @@ def find_product_by_sku_or_barcode(sku=None, barcode=None, title=None):
             for v in p.get("variants", []):
                 if (sku and str(v.get("sku")) == str(sku)) or (barcode and v.get("barcode") and v.get("barcode") == barcode):
                     return p
- 
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
     params = {"limit": 250}
     page = shopify_get(url, params=params) or {}
@@ -157,6 +161,22 @@ def find_product_by_sku_or_barcode(sku=None, barcode=None, title=None):
                 return p
     return None
  
+def _existing_variant_map(existing_product):
+    sku_map = {}
+    option_map = {}
+    for v in existing_product.get("variants", []):
+        vid = v.get("id")
+        sku = str(v.get("sku") or "")
+        opt1 = str(v.get("option1") or "")
+        if sku:
+            sku_map[sku] = vid
+        if opt1:
+            option_map[opt1] = vid
+    return sku_map, option_map
+ 
+# -----------------------------
+# BUILD PRODUCT PAYLOAD
+# -----------------------------
 def build_product(p):
     title = p.get("title") or f"Product-{p.get('sku')}"
     handle = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
@@ -193,9 +213,9 @@ def build_product(p):
         for s in sizes:
             variants.append({
                 "option1": s,
-                "price": price,
+                "price": str(price),
                 "sku": p.get("sku"),
-                "inventory_quantity": stock_qty,
+                "inventory_quantity": int(stock_qty),
                 "inventory_management": "shopify",
                 "cost": cost,
                 "barcode": barcode,
@@ -204,9 +224,9 @@ def build_product(p):
             })
     else:
         variants.append({
-            "price": price,
+            "price": str(price),
             "sku": p.get("sku"),
-            "inventory_quantity": stock_qty,
+            "inventory_quantity": int(stock_qty),
             "inventory_management": "shopify",
             "cost": cost,
             "barcode": barcode,
@@ -233,12 +253,8 @@ def build_product(p):
     return product
  
 # -----------------------------
-# LOAD XML (robust parser + auto-fix)
+# LOAD XML (fragment-safe)
 # -----------------------------
-def _escape_unescaped_amp(text):
-    # replace '&' that are not part of an entity (amp;, lt;, gt;, quot;, apos;)
-    return re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;)', '&amp;', text)
- 
 def load_xml():
     print("📥 Downloading XML...")
     r = requests.get(XML_URL)
@@ -254,14 +270,13 @@ def load_xml():
     except Exception as e:
         print("⚠️ Couldn't save raw feed:", e)
  
-    # Try a quick extraction of <post>...</post> blocks to avoid full-document parse errors
+    # Extract <post> fragments to avoid full-document parse errors
     posts = re.findall(r"<post\b[^>]*?>.*?</post>", raw, flags=re.IGNORECASE | re.DOTALL)
     if posts:
         print(f"🔎 Extracted {len(posts)} <post> blocks from feed (using fragment parsing).")
         items = []
         for fragment in posts[:LIMIT]:
             try:
-                # wrap fragment so ET can parse it as a full document
                 wrapped = f"<root>{fragment}</root>"
                 root = ET.fromstring(wrapped)
                 post_elem = root.find(".//post")
@@ -276,13 +291,11 @@ def load_xml():
         print(f"🔎 Parsed {len(items)} items from <post> fragments (limit {LIMIT}).")
         return items
  
-    # If no <post> blocks found, fall back to trying to parse the whole document (with light fixes)
-    print("ℹ️ No <post> fragments found; attempting full-XML parse with heuristic fixes.")
+    # Fallback: try full parse with light fixes
     try:
         root = ET.fromstring(raw)
     except ParseError as e:
         print("⚠️ XML ParseError:", e)
-        # Escape stray ampersands
         fixed = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;)', '&amp;', raw)
         fixed = re.sub(r"<br\s*>", "<br/>", fixed, flags=re.IGNORECASE)
         try:
@@ -306,7 +319,7 @@ def load_xml():
     return products
  
 # -----------------------------
-# SYNC (unchanged)
+# SYNC
 # -----------------------------
 def run_sync():
     print("🚀 START SYNC")
@@ -326,8 +339,30 @@ def run_sync():
         existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
  
         if existing:
+            sku_map, option_map = _existing_variant_map(existing)
+ 
+            updated_variants = []
+            for v in product_payload["variants"]:
+                vid = None
+                v_sku = str(v.get("sku") or "")
+                opt1 = str(v.get("option1") or "")
+                if v_sku and v_sku in sku_map:
+                    vid = sku_map[v_sku]
+                elif opt1 and opt1 in option_map:
+                    vid = option_map[opt1]
+ 
+                v_copy = v.copy()
+                if vid:
+                    v_copy["id"] = vid
+                v_copy["price"] = str(v_copy.get("price"))
+                v_copy["inventory_quantity"] = int(v_copy.get("inventory_quantity", 0))
+                updated_variants.append(v_copy)
+ 
+            product_update_payload = product_payload.copy()
+            product_update_payload["variants"] = updated_variants
+ 
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-            shopify_put(url, {"product": product_payload})
+            shopify_put(url, {"product": product_update_payload})
             updated += 1
             print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
         else:
