@@ -1,4 +1,4 @@
-name: Honey Sync
+name: honey sync
 
 on:
   schedule:
