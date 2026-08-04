@@ -254,64 +254,50 @@ def load_xml():
     except Exception as e:
         print("⚠️ Couldn't save raw feed:", e)
  
-    # Try parse, on failure give helpful debug info and attempts to repair
+    # Try a quick extraction of <post>...</post> blocks to avoid full-document parse errors
+    posts = re.findall(r"<post\b[^>]*?>.*?</post>", raw, flags=re.IGNORECASE | re.DOTALL)
+    if posts:
+        print(f"🔎 Extracted {len(posts)} <post> blocks from feed (using fragment parsing).")
+        items = []
+        for fragment in posts[:LIMIT]:
+            try:
+                # wrap fragment so ET can parse it as a full document
+                wrapped = f"<root>{fragment}</root>"
+                root = ET.fromstring(wrapped)
+                post_elem = root.find(".//post")
+                if post_elem is None:
+                    continue
+                data = {}
+                for c in post_elem:
+                    data[c.tag.lower()] = c.text
+                items.append(data)
+            except Exception as e:
+                print("⚠️ Failed to parse a <post> fragment:", e)
+        print(f"🔎 Parsed {len(items)} items from <post> fragments (limit {LIMIT}).")
+        return items
+ 
+    # If no <post> blocks found, fall back to trying to parse the whole document (with light fixes)
+    print("ℹ️ No <post> fragments found; attempting full-XML parse with heuristic fixes.")
     try:
         root = ET.fromstring(raw)
     except ParseError as e:
         print("⚠️ XML ParseError:", e)
-        # extract line/col if available
-        msg = str(e)
-        m = re.search(r"line (\d+), column (\d+)", msg)
-        if m:
-            err_line = int(m.group(1))
-            err_col = int(m.group(2))
-            print(f"🔎 Error at line {err_line}, column {err_col}. Showing context:")
-            lines = raw.splitlines()
-            start = max(0, err_line - 6)
-            end = min(len(lines), err_line + 4)
-            for i in range(start, end):
-                indicator = ">>" if (i + 1) == err_line else "  "
-                print(f"{indicator} {i+1:04d}: {lines[i]}")
-        else:
-            print("🔎 Could not extract line/column from error message.")
- 
-        # Attempt 1: escape unescaped ampersands (already in your script)
+        # Escape stray ampersands
         fixed = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;)', '&amp;', raw)
- 
-        # Attempt 2: common stray tag fixes: convert lone <br> to <br/> and close obvious opened tags like <p>, <div>, <span>
         fixed = re.sub(r"<br\s*>", "<br/>", fixed, flags=re.IGNORECASE)
-        # heuristic: close unclosed simple tags if they appear to be left open at the same line (best-effort)
-        # Note: this is intentionally conservative and won't attempt deep HTML repairs
-        fixed = re.sub(r"<(/?)(div|span|p)[^>]*>(?![\s\S]*</\2>)", lambda m: m.group(0) if m.group(1) == "/" else m.group(0) + f"</{m.group(2)}>", fixed, flags=re.IGNORECASE)
- 
-        # Try parse the fixed text
         try:
             root = ET.fromstring(fixed)
-            print("✅ Parsed after heuristic fixes (ampersand/BR/tag).")
             raw = fixed
+            print("✅ Parsed after heuristic fixes.")
         except ParseError as e2:
-            print("⚠️ Still ParseError after heuristic fixes:", e2)
-            # Try BeautifulSoup if available
-            if _HAS_BS4:
-                print("ℹ️ Attempting repair with BeautifulSoup (xml parser)...")
-                soup = BeautifulSoup(raw, "xml")
-                repaired = str(soup)
-                try:
-                    root = ET.fromstring(repaired)
-                    raw = repaired
-                    print("✅ Parsed after BeautifulSoup repair.")
-                except ParseError as e3:
-                    print("❌ Failed to parse even after BeautifulSoup:", e3)
-                    raise
-            else:
-                print("❌ No BeautifulSoup available to attempt repair. Install with: pip install beautifulsoup4")
-                raise
+            print("❌ Still ParseError after heuristic fixes:", e2)
+            raise
  
-    items = root.findall(".//post")
-    print(f"🔎 Found {len(items)} items")
+    items_elem = root.findall(".//post")
+    print(f"🔎 Found {len(items_elem)} items (full parse).")
  
     products = []
-    for item in items[:LIMIT]:
+    for item in items_elem[:LIMIT]:
         data = {}
         for c in item:
             data[c.tag.lower()] = c.text
