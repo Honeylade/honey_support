@@ -1,4 +1,4 @@
-name: updater_graphql Updater
+name: updater_graphql updater
  
 on:
   workflow_dispatch:
