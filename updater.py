@@ -1,26 +1,16 @@
+#!/usr/bin/env python3
+import os
+import re
 import requests
 import xml.etree.ElementTree as ET
-import re
-import os
-import sys
 from xml.etree.ElementTree import ParseError
  
-# Optional: use BeautifulSoup as a last-resort fixer if installed
-try:
-    from bs4 import BeautifulSoup
-    _HAS_BS4 = True
-except Exception:
-    _HAS_BS4 = False
- 
 # -----------------------------
-# CONFIG
+# CONFIG (from env)
 # -----------------------------
-SHOP_URL = os.getenv("SHOP_URL")
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
-XML_URL = os.getenv("XML_URL")
-API_VERSION = "2024-01"
- 
-LIMIT = 4
+SHOP_URL = os.getenv("SHOP_URL")            
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")    
+XML_URL = os.getenv("XML_URL")             
  
 HEADERS = {
     "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -28,7 +18,7 @@ HEADERS = {
     "Accept": "application/json"
 }
  
-TAGS_TO_INCLUDE = ["football accessories", "themed gifts", "Honeylade", "sports gifts", "fan accessories", "novelty gifts", "sports fans"]
+TAGS_TO_INCLUDE = ["football accessories", "Honeylade", "Honey"]
  
 # -----------------------------
 # PRICE LOGIC
@@ -136,7 +126,7 @@ def shopify_put(url, data):
         return {}
  
 # -----------------------------
-# FIND PRODUCT (safe)
+# FIND PRODUCT
 # -----------------------------
 def find_product_by_handle(handle):
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
@@ -253,7 +243,7 @@ def build_product(p):
     return product
  
 # -----------------------------
-# LOAD XML (fragment-safe)
+# LOAD XML (fragment-safe, BeautifulSoup fallback)
 # -----------------------------
 def load_xml():
     print("📥 Downloading XML...")
@@ -270,10 +260,10 @@ def load_xml():
     except Exception as e:
         print("⚠️ Couldn't save raw feed:", e)
  
-    # Extract <post> fragments to avoid full-document parse errors
-    posts = re.findall(r"<post\b[^>]*?>.*?</post>", raw, flags=re.IGNORECASE | re.DOTALL)
+    # First attempt: extract <post> fragments with a robust case-insensitive regex
+    posts = re.findall(r"(?is)<post\b[^>]*?>.*?</post>", raw)
     if posts:
-        print(f"🔎 Extracted {len(posts)} <post> blocks from feed (using fragment parsing).")
+        print(f"🔎 Extracted {len(posts)} <post> blocks from feed (regex fragment parsing).")
         items = []
         for fragment in posts[:LIMIT]:
             try:
@@ -289,34 +279,76 @@ def load_xml():
             except Exception as e:
                 print("⚠️ Failed to parse a <post> fragment:", e)
         print(f"🔎 Parsed {len(items)} items from <post> fragments (limit {LIMIT}).")
-        return items
+        if items:
+            return items
  
-    # Fallback: try full parse with light fixes
+    # Second attempt: try full parse with light fixes (escape ampersands, normalize br)
     try:
         root = ET.fromstring(raw)
+        items_elem = root.findall(".//post")
+        print(f"🔎 Found {len(items_elem)} items (full parse).")
+        products = []
+        for item in items_elem[:LIMIT]:
+            data = {}
+            for c in item:
+                data[c.tag.lower()] = c.text
+            products.append(data)
+        if products:
+            return products
     except ParseError as e:
-        print("⚠️ XML ParseError:", e)
-        fixed = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;)', '&amp;', raw)
-        fixed = re.sub(r"<br\s*>", "<br/>", fixed, flags=re.IGNORECASE)
-        try:
-            root = ET.fromstring(fixed)
-            raw = fixed
-            print("✅ Parsed after heuristic fixes.")
-        except ParseError as e2:
-            print("❌ Still ParseError after heuristic fixes:", e2)
-            raise
+        print("⚠️ XML ParseError on full parse:", e)
  
-    items_elem = root.findall(".//post")
-    print(f"🔎 Found {len(items_elem)} items (full parse).")
+    # Third attempt: use BeautifulSoup to repair malformed XML/HTML and extract <post> tags
+    try:
+        from bs4 import BeautifulSoup
+        print("🔧 Falling back to BeautifulSoup repair parsing...")
+        soup = BeautifulSoup(raw, "html.parser")  # forgiving parser
+        posts_bs = soup.find_all(lambda tag: tag.name and tag.name.lower() == "post")
+        print(f"🔎 BeautifulSoup found {len(posts_bs)} post-like elements.")
+        items = []
+        for post in posts_bs[:LIMIT]:
+            data = {}
+            # iterate children elements
+            for child in post.find_all(recursive=False):
+                tagname = child.name.lower() if child.name else None
+                data[tagname] = child.get_text() if child else None
+            # if no children, try to map attributes or text
+            if not data and post.get_text(strip=True):
+                data["content"] = post.get_text()
+            items.append(data)
+        if items:
+            return items
+    except Exception as e:
+        print("⚠️ BeautifulSoup fallback failed or bs4 missing:", e)
  
-    products = []
-    for item in items_elem[:LIMIT]:
-        data = {}
-        for c in item:
-            data[c.tag.lower()] = c.text
-        products.append(data)
+    # Last resort: attempt to heuristically split by "<post" and look for closing tag fragments
+    print("🔎 Final fallback: heuristic splitting by '<post'...")
+    pieces = re.split(r"(?i)<post\b", raw)
+    candidates = []
+    for piece in pieces[1:LIMIT+1]:
+        snippet = "<post" + piece
+        m = re.search(r"(?is)<post\b.*?</post>", snippet)
+        if m:
+            fragment = m.group(0)
+            try:
+                wrapped = f"<root>{fragment}</root>"
+                root = ET.fromstring(wrapped)
+                post_elem = root.find(".//post")
+                if post_elem is None:
+                    continue
+                data = {}
+                for c in post_elem:
+                    data[c.tag.lower()] = c.text
+                candidates.append(data)
+            except Exception:
+                continue
+    if candidates:
+        print(f"🔎 Heuristic parsed {len(candidates)} items.")
+        return candidates
  
-    return products
+    # If everything fails, log and return empty list (do not raise)
+    print("❌ Could not parse feed into <post> items. Check feed_debug.xml for raw content.")
+    return []
  
 # -----------------------------
 # SYNC
