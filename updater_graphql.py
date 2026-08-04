@@ -45,13 +45,13 @@ except Exception:
 # -----------------------------
 # CONFIG (edit or use env vars)
 # -----------------------------
-SHOP = os.environ.get("SHOP_URL", "your-shop.myshopify.com")  # without https
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "shpat_xxx")
+SHOP = os.environ.get("SHOP_URL", "")  # without https
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
 API_VERSION = os.environ.get("API_VERSION", "2024-01")
 GRAPHQL_ENDPOINT = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
-XML_URL = os.environ.get("XML_URL", "https://example.com/feed.xml")
+XML_URL = os.environ.get("XML_URL", "")
 # LIMIT: None means process ALL products
-LIMIT = None if os.environ.get("LIMIT") in (None, "", "None") else int(os.environ.get("LIMIT"))
+LIMIT = 5 if os.environ.get("LIMIT") in (5, "", "5") else int(os.environ.get("LIMIT"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "25"))
 WORKERS = int(os.environ.get("WORKERS", "2"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
