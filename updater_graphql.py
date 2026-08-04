@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-updater_graphql.py
-Single-file Shopify updater using Admin GraphQL API, streaming XML feed,
-batching, variant-id preservation, and S3 checkpointing for resumable runs.
- 
-Requirements:
-- Python 3.9+
-- requests
-- boto3 (if using S3 checkpointing)
-- lxml
-- beautifulsoup4 (optional fallback)
-"""
- 
 from __future__ import annotations
 import os
 import re
@@ -19,365 +6,217 @@ import sys
 import time
 import json
 import math
-import uuid
-import logging
-import tempfile
 import threading
-from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple, Any
+import traceback
+from typing import List, Dict, Any, Optional, Tuple
+import requests
+import xml.etree.ElementTree as ET
+from xml.etree.ElementTree import ParseError
 from concurrent.futures import ThreadPoolExecutor, as_completed
  
-import requests
-from lxml import etree
- 
-# Optional imports
+# Optional boto3 for S3 checkpointing
 try:
-    from bs4 import BeautifulSoup  # fallback repair
-except Exception:
-    BeautifulSoup = None
- 
-try:
-    import boto3
-    from botocore.exceptions import BotoCoreError, ClientError
+    import boto3  # type: ignore
 except Exception:
     boto3 = None
  
 # -----------------------------
-# CONFIG (edit or use env vars)
+# CONFIG (must be defined before functions)
 # -----------------------------
-SHOP = os.environ.get("SHOP_URL", "")  # without https
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
-API_VERSION = os.environ.get("API_VERSION", "2024-01")
-GRAPHQL_ENDPOINT = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
-XML_URL = os.environ.get("XML_URL", "")
-# LIMIT: None means process ALL products
-LIMIT = 5 if os.environ.get("LIMIT") in (5, "", "5") else int(os.environ.get("LIMIT"))
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "25"))
-WORKERS = int(os.environ.get("WORKERS", "2"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
-CHECKPOINT_S3_BUCKET = os.environ.get("CHECKPOINT_S3_BUCKET")  # optional
-CHECKPOINT_S3_KEY = os.environ.get("CHECKPOINT_S3_KEY", "shopify_updater_checkpoint.json")
-LOCAL_CHECKPOINT = os.environ.get("LOCAL_CHECKPOINT", "checkpoint.json")
-USER_AGENT = "updater_graphql/1.0"
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
- 
-# Pricing constants (example; keep your existing logic)
-FIXED_FEE = 0.80
-FEE_RATE = 0.029
-FEE_FIXED = 0.09
-VAT_RATE = 0.20
+SHOP_URL = os.getenv("SHOP_URL")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+XML_URL = os.getenv("XML_URL")
+API_VERSION = os.getenv("API_VERSION", "2024-01")
+LIMIT = int(os.getenv("LIMIT", "6"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
+WORKERS = int(os.getenv("WORKERS", "4"))
+LOCAL_CHECKPOINT = os.getenv("LOCAL_CHECKPOINT", "checkpoint.json")
+CHECKPOINT_S3_BUCKET = os.getenv("CHECKPOINT_S3_BUCKET")
+CHECKPOINT_S3_KEY = os.getenv("CHECKPOINT_S3_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "eu-west-2")  # optional
  
 HEADERS = {
+    "X-Shopify-Access-Token": ACCESS_TOKEN or "",
     "Content-Type": "application/json",
-    "X-Shopify-Access-Token": ACCESS_TOKEN,
-    "User-Agent": USER_AGENT,
+    "Accept": "application/json"
 }
  
-# Tags that SmartCollections use (example)
-TAGS_TO_INCLUDE = ["Honey", "Honey Spray", "Honeycomb"]
+TAGS_TO_INCLUDE = ["football accessories", "themed gifts", "Honeylade", "Honey", "sports gifts", "fan accessories", "novelty gifts", "sports fans"]
+ 
+# Retry config
+REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
  
 # -----------------------------
-# Logging
+# PRICE LOGIC (unchanged)
 # -----------------------------
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("updater")
- 
-# -----------------------------
-# Utilities: retries/backoff
-# -----------------------------
-def backoff_sleep(attempt: int, base: float = 2.0, jitter: float = 0.1):
-    sleep = (base ** attempt) + (jitter * (2 * (os.urandom(1)[0] / 255.0) - 1))
-    time.sleep(max(0.5, sleep))
- 
-# -----------------------------
-# Checkpoint helpers (S3 or local)
-# -----------------------------
-class CheckpointStore:
-    def __init__(self, s3_bucket: Optional[str] = None, s3_key: Optional[str] = None, local_path: str = "checkpoint.json"):
-        self.s3_bucket = s3_bucket
-        self.s3_key = s3_key
-        self.local_path = local_path
-        self.lock = threading.Lock()
-        self.state = {"last_index": -1, "processed": 0, "errors": []}
-        if s3_bucket and boto3 is None:
-            log.warning("boto3 not installed; S3 checkpointing disabled.")
-            self.s3_bucket = None
- 
-    def load(self):
-        with self.lock:
-            if self.s3_bucket:
-                try:
-                    s3 = boto3.client("s3")
-                    obj = s3.get_object(Bucket=self.s3_bucket, Key=self.s3_key)
-                    buf = obj["Body"].read()
-                    self.state = json.loads(buf)
-                    log.info("Loaded checkpoint from S3.")
-                    return
-                except Exception as e:
-                    log.info("No S3 checkpoint or failed to load: %s", e)
-            if os.path.exists(self.local_path):
-                try:
-                    with open(self.local_path, "r") as f:
-                        self.state = json.load(f)
-                    log.info("Loaded local checkpoint.")
-                except Exception as e:
-                    log.warning("Failed to load local checkpoint: %s", e)
- 
-    def save(self):
-        with self.lock:
-            payload = json.dumps(self.state)
-            if self.s3_bucket:
-                try:
-                    s3 = boto3.client("s3")
-                    s3.put_object(Bucket=self.s3_bucket, Key=self.s3_key, Body=payload.encode("utf-8"))
-                    log.info("Saved checkpoint to S3.")
-                except Exception as e:
-                    log.warning("Failed to save checkpoint to S3: %s", e)
-            try:
-                with open(self.local_path, "w") as f:
-                    f.write(payload)
-                log.info("Saved local checkpoint.")
-            except Exception as e:
-                log.warning("Failed to save local checkpoint: %s", e)
- 
-    def update_progress(self, last_index: int, processed_inc: int = 1, errors: Optional[List[dict]] = None):
-        with self.lock:
-            self.state["last_index"] = last_index
-            self.state["processed"] = self.state.get("processed", 0) + processed_inc
-            if errors:
-                self.state.setdefault("errors", []).extend(errors)
- 
-# -----------------------------
-# XML streaming/fragment parser
-# -----------------------------
-POST_RE = re.compile(r"<post\b.*?>.*?</post>", re.DOTALL | re.IGNORECASE)
- 
-def stream_feed_fragments(xml_text: str):
-    """Yield XML fragments for each <post>...</post> block. Falls back to full parse if needed."""
-    for m in POST_RE.finditer(xml_text):
-        yield m.group(0)
- 
-def fetch_feed_stream(url: str):
-    """Fetch feed and yield fragments; keeps memory low. Safe-decoding of chunks."""
-    r = requests.get(url, stream=True, timeout=60)
-    r.raise_for_status()
-    buf = []
-    for chunk in r.iter_content(chunk_size=65536):
-        if not chunk:
-            continue
-        # Ensure chunk is a str
-        if isinstance(chunk, bytes):
-            chunk = chunk.decode("utf-8", errors="replace")
-        buf.append(chunk)
-        text = "".join(buf)
-        # yield all complete post fragments currently in text
-        matches = list(POST_RE.finditer(text))
-        last_end = 0
-        for m in matches:
-            fragment = m.group(0)
-            yield fragment
-            last_end = m.end()
-        if last_end:
-            buf = [text[last_end:]]
-        # keep only a modest buffer
-        if sum(len(x) for x in buf) > 1_000_000:
-            yield "".join(buf)
-            buf = []
-    # leftover
-    if buf:
-        leftover = "".join(buf)
-        for m in POST_RE.finditer(leftover):
-            yield m.group(0)
- 
-def parse_post_fragment(fragment: str) -> Dict[str, Any]:
-    """Parse required fields from a <post> fragment. Returns dict with keys used by workflow."""
-    # Use lxml fragment parsing
-    try:
-        root = etree.fromstring(fragment.encode("utf-8"))
-    except Exception:
-        # try simple BeautifulSoup fallback
-        if BeautifulSoup:
-            soup = BeautifulSoup(fragment, "xml")
-            def txt(tag):
-                t = soup.find(tag)
-                return t.get_text(strip=True) if t else ""
-            item = {
-                "id": txt("id") or str(uuid.uuid4()),
-                "title": txt("title"),
-                "sku": txt("sku"),
-                "price_cost": float(txt("cost") or 0.0),
-                "size": txt("size"),
-                "weight": txt("weight") or "",  # weight expected in grams (string)
-                "image": txt("image"),
-                "tags": [t.strip() for t in (txt("tags") or "").split(",") if t.strip()],
-                "raw": fragment,
-            }
-            return item
-        else:
-            # last resort: regex extracts
-            def find(tag):
-                m = re.search(rf"<{tag}>(.*?)</{tag}>", fragment, re.DOTALL|re.IGNORECASE)
-                return m.group(1).strip() if m else ""
-            item = {
-                "id": find("id") or str(uuid.uuid4()),
-                "title": find("title"),
-                "sku": find("sku"),
-                "price_cost": float(find("cost") or 0.0),
-                "size": find("size"),
-                "weight": find("weight") or "",
-                "image": find("image"),
-                "tags": [t.strip() for t in (find("tags") or "").split(",") if t.strip()],
-                "raw": fragment,
-            }
-            return item
-    # if lxml succeeded:
-    def g(tag):
-        el = root.find(".//" + tag)
-        return el.text.strip() if el is not None and el.text else ""
-    item = {
-        "id": g("id") or str(uuid.uuid4()),
-        "title": g("title"),
-        "sku": g("sku"),
-        "price_cost": float(g("cost") or 0.0),
-        "size": g("size"),
-        "weight": g("weight") or "",  # weight expected in grams (string)
-        "image": g("image"),
-        "tags": [t.strip() for t in (g("tags") or "").split(",") if t.strip()],
-        "raw": fragment,
-    }
-    return item
- 
-# -----------------------------
-# Pricing with weight-based shipping
-# -----------------------------
-def compute_price_from_cost(cost: float, item: Optional[dict] = None) -> str:
-    """
-    Compute final price string (2 decimals) from cost and item fields.
-    Uses weight-based shipping:
-      weight = float(weight or 0)
-      shipping = 3.99 if weight < 300 else 4.99 if weight < 2000 else 18
-    weight is expected in grams; item['weight'] may be string or numeric.
-    """
-    # margin tiers (example)
+def calc_price(cost, weight):
+    cost = float(cost or 0)
+    weight = float(weight or 0)
+    shipping = 3.99 if weight < 300 else 4.99 if weight < 2000 else 18
     if cost < 5:
         margin = 0.30
     elif cost < 10:
         margin = 0.25
     else:
         margin = 0.20
-    base = cost * (1 + margin)
-    taxed = base * (1 + VAT_RATE)
- 
-    # determine weight (grams)
-    weight_val = None
-    if item:
-        w = item.get("weight")
-        try:
-            weight_val = float(w) if w not in (None, "") else 0.0
-        except Exception:
-            # try to extract digits
-            m = re.search(r"(\d+(\.\d+)?)", str(w or ""))
-            weight_val = float(m.group(1)) if m else 0.0
-    if weight_val is None:
-        weight_val = 0.0
- 
-    # shipping rule (your snippet)
-    if weight_val < 300:
-        shipping = 3.99
-    elif weight_val < 2000:
-        shipping = 4.99
-    else:
-        shipping = 18.00
- 
-    fees_factor = FEE_RATE + FEE_FIXED
-    if fees_factor >= 1.0:
-        raise ValueError("fees factor invalid")
-    final_after_fees = taxed / (1 - fees_factor)
-    final = final_after_fees + shipping + FIXED_FEE
-    return f"{round(final + 1e-9, 2):.2f}"  # price as string with 2 decimals
+    TAX = 0.20
+    FEES = 0.029 + 0.090
+    FIXED_COSTS = 0.30 + 0.50
+    base_price = cost * (1 + margin)
+    taxed_price = base_price * (1 + TAX)
+    price_after_fees = taxed_price / (1 - FEES)
+    final_price = price_after_fees + shipping + FIXED_COSTS
+    return round(final_price, 2)
  
 # -----------------------------
-# GraphQL helpers
+# HELPERS
 # -----------------------------
-def graphql_request(query: str, variables: Optional[dict] = None, max_retry: int = MAX_RETRIES) -> dict:
-    body = {"query": query}
-    if variables is not None:
-        body["variables"] = variables
-    attempt = 0
-    while True:
-        attempt += 1
+def log(*args, **kwargs):
+    print(*args, **kwargs)
+    sys.stdout.flush()
+ 
+def last_value(val):
+    if not val:
+        return ""
+    v = val.split(">")[-1].strip()
+    return v.replace("&amp;", "and").replace("&", "and")
+ 
+def split_tags(val):
+    if not val:
+        return []
+    return [t.strip() for t in re.split(r"[>\|,;/\s]+", val) if t.strip()]
+ 
+def sanitize_tags(tags):
+    sanitized = []
+    seen = set()
+    for tag in tags:
+        if not tag:
+            continue
+        t = tag.replace('&', 'and').strip()
+        if len(t) > 255:
+            t = t[:255]
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            sanitized.append(t)
+    return sanitized
+ 
+def build_description(p):
+    bullets = []
+    for i in range(1, 11):
+        v = p.get(f"desc_{i}")
+        if v:
+            bullets.append(f"<li>{v}</li>")
+    bullet_html = f"<ul>{''.join(bullets)}</ul>" if bullets else ""
+    paragraph = f"<p>{p.get('desc_standard','') or ''}</p>"
+    return bullet_html + paragraph
+ 
+def valid_image(url):
+    if not url:
+        return False
+    url = url.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False
+    if " " in url:
+        return False
+    if not any(url.lower().endswith(ext) or ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+        return False
+    return True
+ 
+# -----------------------------
+# HTTP with retry wrapper
+# -----------------------------
+def http_request(method: str, url: str, **kwargs):
+    for attempt in range(1, REQUEST_RETRIES + 1):
         try:
-            r = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS, json=body, timeout=60)
-            if r.status_code == 200:
-                data = r.json()
-                if "errors" in data:
-                    log.warning("GraphQL returned errors: %s", data["errors"])
-                return data
-            elif r.status_code in (429, 500, 502, 503, 504):
-                if attempt > max_retry:
-                    r.raise_for_status()
-                log.warning("GraphQL transient error %s; backoff attempt %d", r.status_code, attempt)
-                backoff_sleep(attempt)
-                continue
-            else:
-                r.raise_for_status()
-        except requests.RequestException as e:
-            if attempt > max_retry:
+            r = requests.request(method, url, timeout=REQUEST_TIMEOUT, headers=HEADERS, **kwargs)
+            # let caller inspect status / body
+            return r
+        except Exception as e:
+            log(f"⚠️ HTTP {method} {url} attempt {attempt} failed: {e}")
+            if attempt == REQUEST_RETRIES:
                 raise
-            log.warning("GraphQL request exception %s; retrying attempt %d", e, attempt)
-            backoff_sleep(attempt)
- 
-PRODUCT_BY_HANDLE_QUERY = """
-query productByHandle($handle: String!) {
-  productByHandle(handle: $handle) {
-    id
-    title
-    variants(first: 250) {
-      edges { node {
-        id
-        sku
-        price
-        inventoryQuantity
-        selectedOptions { name value }
-      }}
-    }
-    images(first: 10) { edges { node { src } } }
-    tags
-  }
-}
-"""
- 
-PRODUCT_UPDATE_MUTATION = """
-mutation productUpdate($input: ProductInput!) {
-  productUpdate(input: $input) {
-    product { id, title }
-    userErrors { field message }
-  }
-}
-"""
- 
-def to_gid(type_name: str, id_value: str):
-    if id_value.startswith("gid://"):
-        return id_value
-    return f"gid://shopify/{type_name}/{id_value}"
+            time.sleep(1 + attempt)
  
 # -----------------------------
-# Variant mapping helpers
+# SHOPIFY WRAPPERS (REST)
 # -----------------------------
-def map_existing_variants(existing_product: dict) -> Tuple[Dict[str, str], Dict[str, str]]:
+def shopify_get(url, params=None):
+    r = http_request("GET", url, params=params)
+    try:
+        return r.json() if r.status_code in (200, 201) else {}
+    except ValueError:
+        return {}
+ 
+def shopify_post(url, data):
+    r = http_request("POST", url, json=data)
+    if r.status_code not in [200, 201]:
+        log("❌ POST ERROR:", r.status_code, r.text)
+    try:
+        return r.json()
+    except ValueError:
+        return {}
+ 
+def shopify_put(url, data):
+    r = http_request("PUT", url, json=data)
+    if r.status_code not in [200, 201]:
+        log("❌ PUT ERROR:", r.status_code, r.text)
+    try:
+        return r.json()
+    except ValueError:
+        return {}
+ 
+# -----------------------------
+# FIND PRODUCT (with pagination)
+# -----------------------------
+def find_product_by_handle(handle: str) -> Optional[Dict[str, Any]]:
+    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+    res = shopify_get(url, {"handle": handle})
+    products = res.get("products") or []
+    return products[0] if products else None
+ 
+def find_product_by_sku_or_barcode(sku: Optional[str] = None, barcode: Optional[str] = None, title: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    # Try title search (cheap)
+    if title:
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+        res = shopify_get(url, {"title": title})
+        for p in res.get("products", []) or []:
+            for v in p.get("variants", []):
+                if (sku and str(v.get("sku")) == str(sku)) or (barcode and v.get("barcode") and v.get("barcode") == barcode):
+                    return p
+    # Full scan with pagination (limit 250 per page)
+    base = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+    params = {"limit": 250}
+    page_info = None
+    # Use since_id pagination as safe fallback: iterate until no more or found
+    last_id = 0
+    while True:
+        params = {"limit": 250, "since_id": last_id}
+        res = shopify_get(base, params=params) or {}
+        prods = res.get("products", []) or []
+        if not prods:
+            break
+        for p in prods:
+            for v in p.get("variants", []) or []:
+                if (sku and str(v.get("sku")) == str(sku)) or (barcode and v.get("barcode") and v.get("barcode") == barcode):
+                    return p
+        # set last_id to max id on page
+        try:
+            last_id = max(int(p.get("id", 0)) for p in prods)
+        except Exception:
+            break
+        # safety: avoid endless loop
+        if last_id == 0:
+            break
+    return None
+ 
+def _existing_variant_map(existing_product: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     sku_map = {}
     option_map = {}
-    if not existing_product:
-        return sku_map, option_map
-    variants = existing_product.get("variants", {}).get("edges", [])
-    for edge in variants:
-        node = edge.get("node", {})
-        vid = node.get("id")
-        sku = str(node.get("sku") or "")
-        opts = node.get("selectedOptions") or []
-        opt1 = ""
-        if opts:
-            opt1 = str(opts[0].get("value") or "")
+    for v in existing_product.get("variants", []):
+        vid = v.get("id")
+        sku = str(v.get("sku") or "")
+        opt1 = str(v.get("option1") or "")
         if sku:
             sku_map[sku] = vid
         if opt1:
@@ -385,132 +224,331 @@ def map_existing_variants(existing_product: dict) -> Tuple[Dict[str, str], Dict[
     return sku_map, option_map
  
 # -----------------------------
-# Product build & update
+# BUILD PRODUCT PAYLOAD
 # -----------------------------
-def build_product_input(item: dict, existing_variant_maps: Tuple[Dict[str,str], Dict[str,str]], existing_product_gid: Optional[str]):
-    sku_map, option_map = existing_variant_maps
-    variants = []
-    # compute price using item (weight-aware)
-    price_str = compute_price_from_cost(item.get("price_cost", 0.0), item)
-    inventory_qty = item.get("inventory_quantity")
+def build_product(p: Dict[str, Any]) -> Dict[str, Any]:
+    title = p.get("title") or f"Product-{p.get('sku')}"
+    handle = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
     try:
-        inventory_qty = int(inventory_qty) if inventory_qty is not None else None
+        cost = float(p.get("costprice") or 0)
     except Exception:
-        inventory_qty = None
- 
-    variant = {
-        "sku": item.get("sku"),
-        "price": price_str,
-        "inventoryQuantity": inventory_qty,
-        "option1": item.get("size") or "",
-    }
-    existing_vid = None
-    if variant["sku"] and variant["sku"] in sku_map:
-        existing_vid = sku_map[variant["sku"]]
-    elif variant["option1"] and variant["option1"] in option_map:
-        existing_vid = option_map[variant["option1"]]
-    if existing_vid:
-        variant["id"] = existing_vid
-    if variant.get("inventoryQuantity") is None:
-        variant.pop("inventoryQuantity", None)
-    variants.append(variant)
- 
-    input_payload = {
-        **({"id": existing_product_gid} if existing_product_gid else {}),
-        "title": item.get("title") or f"Product {item.get('id')}",
-        "tags": ",".join(item.get("tags", []) + TAGS_TO_INCLUDE),
-        "variants": variants,
-    }
-    image_src = item.get("image")
-    if image_src:
-        input_payload["images"] = [{"src": image_src}]
-    return input_payload
- 
-# -----------------------------
-# Worker: process a batch of items
-# -----------------------------
-def process_batch(batch: List[dict], checkpoint: CheckpointStore, start_index: int):
-    errors = []
-    processed = 0
-    for idx, item in enumerate(batch):
-        global_index = start_index + idx
-        try:
-            handle = item.get("title", "").lower().replace(" ", "-")[:200] or f"p-{item.get('id')}"
-            variables = {"handle": handle}
-            resp = graphql_request(PRODUCT_BY_HANDLE_QUERY, variables=variables)
-            data = resp.get("data", {})
-            existing = data.get("productByHandle")
-            existing_gid = existing.get("id") if existing else None
- 
-            existing_maps = map_existing_variants(existing) if existing else ({}, {})
-            input_payload = build_product_input(item, existing_maps, existing_gid)
-            mutation_vars = {"input": input_payload}
-            resp2 = graphql_request(PRODUCT_UPDATE_MUTATION, variables=mutation_vars)
-            errs = resp2.get("data", {}).get("productUpdate", {}).get("userErrors", [])
-            if errs:
-                log.error("User errors updating product %s: %s", handle, errs)
-                errors.append({"index": global_index, "id": item.get("id"), "errors": errs})
-            else:
-                log.info("Updated/created product for item id=%s (handle=%s)", item.get("id"), handle)
-            processed += 1
-        except Exception as e:
-            log.exception("Failed item index %d id %s: %s", global_index, item.get("id"), e)
-            errors.append({"index": global_index, "id": item.get("id"), "exc": str(e)})
-        checkpoint.update_progress(global_index, processed_inc=0, errors=None)
-    checkpoint.update_progress(start_index + len(batch) - 1, processed_inc=processed, errors=errors)
-    checkpoint.save()
-    return processed, errors
- 
-# -----------------------------
-# Main processing loop
-# -----------------------------
-def main():
-    log.info("Starting updater script")
-    checkpoint = CheckpointStore(CHECKPOINT_S3_BUCKET, CHECKPOINT_S3_KEY, LOCAL_CHECKPOINT)
-    checkpoint.load()
-    last_index = checkpoint.state.get("last_index", -1)
-    processed_total = checkpoint.state.get("processed", 0)
- 
-    fragments = fetch_feed_stream(XML_URL)
-    buffer_batch = []
-    index = -1
- 
-    target_limit = LIMIT
- 
-    def submit_and_wait(batch_items, start_idx):
-        return process_batch(batch_items, checkpoint, start_idx)
- 
-    with ThreadPoolExecutor(max_workers=WORKERS) as exe:
-        for fragment in fragments:
-            index += 1
-            if target_limit and index >= target_limit:
-                log.info("Reached LIMIT %d; breaking", target_limit)
-                break
-            if index <= last_index:
-                continue
-            try:
-                item = parse_post_fragment(fragment)
-            except Exception as e:
-                log.exception("Failed to parse fragment at index %d: %s", index, e)
-                checkpoint.update_progress(index, processed_inc=0, errors=[{"index": index, "parse_error": str(e)}])
-                checkpoint.save()
-                continue
-            buffer_batch.append(item)
-            if len(buffer_batch) >= BATCH_SIZE:
-                start_idx = index - len(buffer_batch) + 1
-                processed, errs = submit_and_wait(buffer_batch, start_idx)
-                processed_total += processed
-                buffer_batch = []
-        if buffer_batch:
-            start_idx = index - len(buffer_batch) + 1
-            processed, errs = submit_and_wait(buffer_batch, start_idx)
-            processed_total += processed
- 
-    log.info("Finished processing. Total processed this run: %d; last_index=%d", processed_total, checkpoint.state.get("last_index"))
- 
-if __name__ == "__main__":
+        cost = 0.0
     try:
-        main()
-    except KeyboardInterrupt:
-        log.info("Interrupted by user; exiting.")
-        sys.exit(1)
+        weight = float(p.get("weight") or 0)
+    except Exception:
+        weight = 0.0
+    price = calc_price(cost, weight)
+    vendor = last_value(p.get("productbrand"))
+    product_type = last_value(p.get("productrange"))
+    tags = (
+        split_tags(p.get("productbrand")) +
+        split_tags(p.get("productrange")) +
+        TAGS_TO_INCLUDE +
+        split_tags(title)
+    )
+    tags = sanitize_tags(tags)
+    description = build_description(p)
+    raw_images = (p.get("imageoffloads") or "")
+    raw_images = re.split(r"[|,]+", raw_images)
+    images = [{"src": img.strip()} for img in raw_images if valid_image(img)]
+    variants = []
+    sizes_raw = (p.get("sizeattribute") or "")
+    sizes = [s.strip() for s in re.split(r"[|,]+", sizes_raw) if s.strip()]
+    try:
+        stock_qty = int(p.get("stock") or 0)
+    except Exception:
+        stock_qty = 0
+    barcode = p.get("barcode") if p.get("barcode") else None
+    if sizes:
+        for s in sizes:
+            variants.append({
+                "option1": s,
+                "price": str(price),
+                "sku": p.get("sku"),
+                "inventory_quantity": int(stock_qty),
+                "inventory_management": "shopify",
+                "cost": cost,
+                "barcode": barcode,
+                "weight": weight,
+                "weight_unit": "g"
+            })
+    else:
+        variants.append({
+            "price": str(price),
+            "sku": p.get("sku"),
+            "inventory_quantity": int(stock_qty),
+            "inventory_management": "shopify",
+            "cost": cost,
+            "barcode": barcode,
+            "weight": weight,
+            "weight_unit": "g"
+        })
+    product = {
+        "title": title,
+        "body_html": description,
+        "vendor": vendor,
+        "product_type": product_type,
+        "tags": ", ".join(tags),
+        "handle": handle,
+        "status": "active" if stock_qty > 0 else "draft",
+        "published": True if stock_qty > 0 else False,
+        "variants": variants,
+        **({"images": images} if images else {})
+    }
+    if len(variants) > 1:
+        product["options"] = [{"name": "Size", "values": sizes}]
+    return product
+ 
+# -----------------------------
+# LOAD XML (fragment-safe, BeautifulSoup fallback)
+# -----------------------------
+def load_xml(limit: int) -> List[Dict[str, Any]]:
+    log("📥 Downloading XML feed...")
+    r = http_request("GET", XML_URL)
+    r.raise_for_status()
+    raw_bytes = r.content
+    raw = raw_bytes.decode('utf-8', errors='replace')
+    try:
+        with open("feed_debug.xml", "wb") as f:
+            f.write(raw_bytes)
+        log("ℹ️ Saved raw feed to feed_debug.xml")
+    except Exception as e:
+        log("⚠️ Couldn't save raw feed:", e)
+    posts = re.findall(r"(?is)<post\b[^>]*?>.*?</post>", raw)
+    if posts:
+        log(f"🔎 Extracted {len(posts)} <post> blocks from feed (regex fragment parsing).")
+        items = []
+        for fragment in posts[:limit]:
+            try:
+                wrapped = f"<root>{fragment}</root>"
+                root = ET.fromstring(wrapped)
+                post_elem = root.find(".//post")
+                if post_elem is None:
+                    continue
+                data = {}
+                for c in post_elem:
+                    data[c.tag.lower()] = c.text
+                items.append(data)
+            except Exception as e:
+                log("⚠️ Failed to parse a <post> fragment:", e)
+        log(f"🔎 Parsed {len(items)} items from <post> fragments (limit {limit}).")
+        if items:
+            return items
+    try:
+        root = ET.fromstring(raw)
+        items_elem = root.findall(".//post")
+        log(f"🔎 Found {len(items_elem)} items (full parse).")
+        products = []
+        for item in items_elem[:limit]:
+            data = {}
+            for c in item:
+                data[c.tag.lower()] = c.text
+            products.append(data)
+        if products:
+            return products
+    except ParseError as e:
+        log("⚠️ XML ParseError on full parse:", e)
+    try:
+        from bs4 import BeautifulSoup
+        log("🔧 Falling back to BeautifulSoup repair parsing...")
+        soup = BeautifulSoup(raw, "html.parser")
+        posts_bs = soup.find_all(lambda tag: tag.name and tag.name.lower() == "post")
+        log(f"🔎 BeautifulSoup found {len(posts_bs)} post-like elements.")
+        items = []
+        for post in posts_bs[:limit]:
+            data = {}
+            for child in post.find_all(recursive=False):
+                tagname = child.name.lower() if child.name else None
+                data[tagname] = child.get_text() if child else None
+            if not data and post.get_text(strip=True):
+                data["content"] = post.get_text()
+            items.append(data)
+        if items:
+            return items
+    except Exception as e:
+        log("⚠️ BeautifulSoup fallback failed or bs4 missing:", e)
+    log("🔎 Final fallback: heuristic splitting by '<post'...")
+    pieces = re.split(r"(?i)<post\b", raw)
+    candidates = []
+    for piece in pieces[1:limit+1]:
+        snippet = "<post" + piece
+        m = re.search(r"(?is)<post\b.*?</post>", snippet)
+        if m:
+            fragment = m.group(0)
+            try:
+                wrapped = f"<root>{fragment}</root>"
+                root = ET.fromstring(wrapped)
+                post_elem = root.find(".//post")
+                if post_elem is None:
+                    continue
+                data = {}
+                for c in post_elem:
+                    data[c.tag.lower()] = c.text
+                candidates.append(data)
+            except Exception:
+                continue
+    if candidates:
+        log(f"🔎 Heuristic parsed {len(candidates)} items.")
+        return candidates
+    log("❌ Could not parse feed into <post> items. Check feed_debug.xml for raw content.")
+    return []
+ 
+# -----------------------------
+# Checkpointing (local + optional S3)
+# -----------------------------
+_checkpoint_lock = threading.Lock()
+ 
+def load_checkpoint() -> Dict[str, Any]:
+    state = {"processed_handles": [], "last_index": 0}
+    # load local
+    if os.path.exists(LOCAL_CHECKPOINT):
+        try:
+            with open(LOCAL_CHECKPOINT, "r") as f:
+                state = json.load(f)
+                log("🔁 Loaded local checkpoint:", LOCAL_CHECKPOINT)
+        except Exception:
+            log("⚠️ Failed reading local checkpoint; starting fresh")
+    # try S3 override if present
+    if CHECKPOINT_S3_BUCKET and CHECKPOINT_S3_KEY and boto3:
+        try:
+            s3 = boto3.client("s3", region_name=AWS_REGION)
+            obj = s3.get_object(Bucket=CHECKPOINT_S3_BUCKET, Key=CHECKPOINT_S3_KEY)
+            body = obj["Body"].read()
+            s3_state = json.loads(body.decode("utf-8"))
+            state = s3_state
+            log("🔁 Loaded checkpoint from S3:", CHECKPOINT_S3_BUCKET, CHECKPOINT_S3_KEY)
+        except Exception as e:
+            log("⚠️ Could not load S3 checkpoint:", e)
+    return state
+ 
+def save_checkpoint(state: Dict[str, Any]) -> None:
+    with _checkpoint_lock:
+        try:
+            with open(LOCAL_CHECKPOINT, "w") as f:
+                json.dump(state, f)
+            log("💾 Saved local checkpoint:", LOCAL_CHECKPOINT)
+        except Exception as e:
+            log("⚠️ Failed saving local checkpoint:", e)
+        if CHECKPOINT_S3_BUCKET and CHECKPOINT_S3_KEY and boto3:
+            try:
+                s3 = boto3.client("s3", region_name=AWS_REGION)
+                s3.put_object(Bucket=CHECKPOINT_S3_BUCKET, Key=CHECKPOINT_S3_KEY, Body=json.dumps(state).encode("utf-8"))
+                log("💾 Saved checkpoint to S3:", CHECKPOINT_S3_BUCKET, CHECKPOINT_S3_KEY)
+            except Exception as e:
+                log("⚠️ Failed saving checkpoint to S3:", e)
+ 
+# -----------------------------
+# Worker: process one product payload (create/update)
+# -----------------------------
+def process_item(p: Dict[str, Any], checkpoint_state: Dict[str, Any]) -> Tuple[str, Optional[int], str]:
+    """
+    Returns tuple: (action, product_id_or_None, message)
+    action: "created", "updated", "skipped", "failed"
+    """
+    try:
+        product_payload = build_product(p)
+        handle = product_payload.get("handle")
+        sku = p.get("sku")
+        barcode = p.get("barcode")
+        title = product_payload.get("title")
+        # skip if already processed in checkpoint
+        if handle in checkpoint_state.get("processed_handles", []):
+            return ("skipped", None, f"Already processed handle {handle}")
+        existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
+        if existing:
+            sku_map, option_map = _existing_variant_map(existing)
+            updated_variants = []
+            for v in product_payload["variants"]:
+                vid = None
+                v_sku = str(v.get("sku") or "")
+                opt1 = str(v.get("option1") or "")
+                if v_sku and v_sku in sku_map:
+                    vid = sku_map[v_sku]
+                elif opt1 and opt1 in option_map:
+                    vid = option_map[opt1]
+                v_copy = v.copy()
+                if vid:
+                    v_copy["id"] = vid
+                v_copy["price"] = str(v_copy.get("price"))
+                v_copy["inventory_quantity"] = int(v_copy.get("inventory_quantity", 0))
+                updated_variants.append(v_copy)
+            product_update_payload = product_payload.copy()
+            product_update_payload["variants"] = updated_variants
+            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+            shopify_put(url, {"product": product_update_payload})
+            # update checkpoint atomically
+            with _checkpoint_lock:
+                checkpoint_state.setdefault("processed_handles", []).append(handle)
+                checkpoint_state["last_index"] = checkpoint_state.get("last_index", 0) + 1
+                save_checkpoint(checkpoint_state)
+            return ("updated", existing.get("id"), f"Updated: {title} (ID: {existing.get('id')})")
+        else:
+            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+            res = shopify_post(url, {"product": product_payload})
+            product_id = res.get("product", {}).get("id")
+            if product_id:
+                with _checkpoint_lock:
+                    checkpoint_state.setdefault("processed_handles", []).append(handle)
+                    checkpoint_state["last_index"] = checkpoint_state.get("last_index", 0) + 1
+                    save_checkpoint(checkpoint_state)
+                return ("created", product_id, f"Created: {title} (ID: {product_id})")
+            else:
+                return ("failed", None, f"Failed to create: {title} - response: {res}")
+    except Exception as exc:
+        log("❌ Exception processing item:", exc)
+        traceback.print_exc()
+        return ("failed", None, f"Exception: {exc}")
+ 
+# -----------------------------
+# Batching utilities
+# -----------------------------
+def chunked(it: List[Any], size: int):
+    for i in range(0, len(it), size):
+        yield it[i:i+size]
+ 
+# -----------------------------
+# MAIN SYNC LOOP (batched + threads)
+# -----------------------------
+def run_sync():
+    if not SHOP_URL or not ACCESS_TOKEN or not XML_URL:
+        log("❌ SHOP_URL, ACCESS_TOKEN and XML_URL must be set.")
+        sys.exit(2)
+    state = load_checkpoint()
+    last_index = int(state.get("last_index", 0))
+    log(f"🚀 START SYNC (LIMIT={LIMIT}, BATCH_SIZE={BATCH_SIZE}, WORKERS={WORKERS}) - resuming at index {last_index}")
+    items = load_xml(LIMIT)
+    if not items:
+        log("❌ No items parsed from feed; aborting.")
+        return
+    total = len(items)
+    log(f"🔁 Will process {total} items (limited to {LIMIT}).")
+    created = 0
+    updated = 0
+    failed = 0
+    skipped = 0
+    # process in batches
+    for batch_idx, batch in enumerate(chunked(items, BATCH_SIZE), start=1):
+        log(f"🔸 Processing batch {batch_idx} - {len(batch)} items")
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futures = {ex.submit(process_item, p, state): p for p in batch}
+            for fut in as_completed(futures):
+                action, pid, msg = fut.result()
+                if action == "created":
+                    created += 1
+                elif action == "updated":
+                    updated += 1
+                elif action == "skipped":
+                    skipped += 1
+                else:
+                    failed += 1
+                log(f"  -> {action.upper()}: {msg}")
+        # small throttle between batches
+        time.sleep(0.5)
+    log("✅ DONE")
+    log(f"Created: {created}, Updated: {updated}, Skipped: {skipped}, Failed: {failed}")
+ 
+# -----------------------------
+# RUN
+# -----------------------------
+if __name__ == "__main__":
+    run_sync()
