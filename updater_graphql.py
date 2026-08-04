@@ -158,13 +158,16 @@ def stream_feed_fragments(xml_text: str):
         yield m.group(0)
  
 def fetch_feed_stream(url: str):
-    """Fetch feed and yield fragments; keeps memory low."""
+    """Fetch feed and yield fragments; keeps memory low. Safe-decoding of chunks."""
     r = requests.get(url, stream=True, timeout=60)
     r.raise_for_status()
     buf = []
-    for chunk in r.iter_content(chunk_size=65536, decode_unicode=True):
+    for chunk in r.iter_content(chunk_size=65536):
         if not chunk:
             continue
+        # Ensure chunk is a str
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode("utf-8", errors="replace")
         buf.append(chunk)
         text = "".join(buf)
         # yield all complete post fragments currently in text
@@ -178,13 +181,11 @@ def fetch_feed_stream(url: str):
             buf = [text[last_end:]]
         # keep only a modest buffer
         if sum(len(x) for x in buf) > 1_000_000:
-            # fallback: attempt to salvage by yielding and clearing buffer
             yield "".join(buf)
             buf = []
     # leftover
     if buf:
         leftover = "".join(buf)
-        # try to extract remaining posts
         for m in POST_RE.finditer(leftover):
             yield m.group(0)
  
