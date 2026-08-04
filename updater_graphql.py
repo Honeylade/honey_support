@@ -17,7 +17,7 @@ SHOP_URL = os.getenv("SHOP_URL")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 XML_URL = os.getenv("XML_URL")
 API_VERSION = "2024-01"
-LIMIT = int(os.getenv("LIMIT", "4"))
+LIMIT = 4
  
 if not all([SHOP_URL, ACCESS_TOKEN, XML_URL]):
     logging.error("Environment variables SHOP_URL, ACCESS_TOKEN, and XML_URL must be set.")
