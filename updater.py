@@ -8,9 +8,9 @@ from xml.etree.ElementTree import ParseError
 # -----------------------------
 # CONFIG (must be defined before functions)
 # -----------------------------
-SHOP_URL = os.getenv("SHOP_URL")            # e.g. "your-shop.myshopify.com"
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")    # shpat_...
-XML_URL = os.getenv("XML_URL")              # feed URL
+SHOP_URL = os.getenv("SHOP_URL")            
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")   
+XML_URL = os.getenv("XML_URL")              
 API_VERSION = "2024-01"
 LIMIT = int(os.getenv("LIMIT", "4"))
  
