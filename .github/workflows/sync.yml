@@ -2,7 +2,7 @@ name: honey sync
 
 on:
   schedule:
-    - cron: '30 */2 * * *'   # every 2:30 hours
+    - cron: '30 */4 * * *'   # every 2:30 hours
   workflow_dispatch:
 
 jobs:
