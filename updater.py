@@ -4,15 +4,16 @@ import re
 import requests
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import ParseError
+import time  # For adding delays between requests
  
 # -----------------------------
 # CONFIG (must be defined before functions)
 # -----------------------------
-SHOP_URL = os.getenv("SHOP_URL")            
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")   
-XML_URL = os.getenv("XML_URL")              
+SHOP_URL = os.getenv("SHOP_URL")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+XML_URL = os.getenv("XML_URL")
 API_VERSION = "2024-01"
-LIMIT = int(os.getenv("LIMIT", "4"))  # allow all products = None   # or 0
+LIMIT = int(os.getenv("LIMIT", "250"))  # Allow all products = None or 0, default to 250 for batch size
  
 HEADERS = {
     "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -29,12 +30,7 @@ def calc_price(cost, weight):
     cost = float(cost or 0)
     weight = float(weight or 0)
     shipping = 3.99 if weight < 300 else 4.99 if weight < 2000 else 18
-    if cost < 5:
-        margin = 0.30
-    elif cost < 10:
-        margin = 0.25
-    else:
-        margin = 0.20
+    margin = 0.30 if cost < 5 else 0.25 if cost < 10 else 0.20
     TAX = 0.20
     FEES = 0.029 + 0.090
     FIXED_COSTS = 0.30 + 0.50
@@ -65,8 +61,7 @@ def sanitize_tags(tags):
         if not tag:
             continue
         t = tag.replace('&', 'and').strip()
-        if len(t) > 255:
-            t = t[:255]
+        t = t[:255] if len(t) > 255 else t
         if t.lower() not in seen:
             seen.add(t.lower())
             sanitized.append(t)
@@ -102,24 +97,27 @@ def shopify_get(url, params=None):
     try:
         return r.json() if r.status_code == 200 else {}
     except ValueError:
+        print(f"⚠️ Error parsing response for GET request to {url}: {r.text}")
         return {}
  
 def shopify_post(url, data):
     r = requests.post(url, headers=HEADERS, json=data)
     if r.status_code not in [200, 201]:
-        print("❌ POST ERROR:", r.status_code, r.text)
+        print(f"❌ POST ERROR: {r.status_code} - {r.text}")
     try:
         return r.json()
     except ValueError:
+        print(f"⚠️ Error parsing response for POST request to {url}: {r.text}")
         return {}
  
 def shopify_put(url, data):
     r = requests.put(url, headers=HEADERS, json=data)
     if r.status_code not in [200, 201]:
-        print("❌ PUT ERROR:", r.status_code, r.text)
+        print(f"❌ PUT ERROR: {r.status_code} - {r.text}")
     try:
         return r.json()
     except ValueError:
+        print(f"⚠️ Error parsing response for PUT request to {url}: {r.text}")
         return {}
  
 # -----------------------------
@@ -299,7 +297,7 @@ def load_xml():
     print("🔎 Final fallback: heuristic splitting by '<post'...")
     pieces = re.split(r"(?i)<post\b", raw)
     candidates = []
-    for piece in pieces[1:LIMIT+1]:
+    for piece in pieces[1:LIMIT + 1]:
         snippet = "<post" + piece
         m = re.search(r"(?is)<post\b.*?</post>", snippet)
         if m:
@@ -337,6 +335,7 @@ def run_sync():
         barcode = p.get("barcode")
         title = product_payload.get("title")
         existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
+        
         if existing:
             sku_map, option_map = _existing_variant_map(existing)
             updated_variants = []
@@ -369,6 +368,10 @@ def run_sync():
                 print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
             else:
                 print(f"❌ Failed to create: {product_payload['title']}")
+ 
+        # Adding delay to prevent hitting API rate limits
+        time.sleep(1)  # Adjust as necessary, e.g., 1 second between requests
+ 
     print("✅ DONE")
     print(f"Created: {created}, Updated: {updated}")
  
