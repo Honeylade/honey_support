@@ -90,7 +90,7 @@ def valid_image(url):
     return True
  
 # -----------------------------
-# SHOPIFY WRAPPERS
+# STORE WRAPPERS
 # -----------------------------
 def shopify_get(url, params=None):
     r = requests.get(url, headers=HEADERS, params=params)
