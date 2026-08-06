@@ -13,7 +13,7 @@ SHOP_URL = os.getenv("SHOP_URL")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 XML_URL = os.getenv("XML_URL")
 API_VERSION = "2024-01"
-LIMIT = int(os.getenv("LIMIT", "6000"))  # Allow all products = None or 0, default to 250 for batch size
+LIMIT = int(os.getenv("LIMIT", "5100"))  # Allow all products = None or 0, default to 250 for batch size
  
 HEADERS = {
     "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -90,7 +90,7 @@ def valid_image(url):
     return True
  
 # -----------------------------
-# STORE WRAPPERS
+# SHOPIFY WRAPPERS
 # -----------------------------
 def shopify_get(url, params=None):
     r = requests.get(url, headers=HEADERS, params=params)
@@ -328,58 +328,49 @@ def run_sync():
     items = load_xml()
     created = 0
     updated = 0
-    
-    # Check if LIMIT is 0, meaning all products should be processed
-    total_items = len(items)
-    if LIMIT == 0 or total_items <= LIMIT:
-        limit_to_process = total_items
-    else:
-        limit_to_process = LIMIT
-    
-    for i in range(0, limit_to_process, 250):  # Process in batches of 250
-        batch = items[i:i + 250]  # Get the current batch of products
-        for p in batch:
-            product_payload = build_product(p)
-            handle = product_payload.get("handle")
-            sku = p.get("sku")
-            barcode = p.get("barcode")
-            title = product_payload.get("title")
-            existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
-            
-            if existing:
-                sku_map, option_map = _existing_variant_map(existing)
-                updated_variants = []
-                for v in product_payload["variants"]:
-                    vid = None
-                    v_sku = str(v.get("sku") or "")
-                    opt1 = str(v.get("option1") or "")
-                    if v_sku and v_sku in sku_map:
-                        vid = sku_map[v_sku]
-                    elif opt1 and opt1 in option_map:
-                        vid = option_map[opt1]
-                    v_copy = v.copy()
-                    if vid:
-                        v_copy["id"] = vid
-                    v_copy["price"] = str(v_copy.get("price"))
-                    v_copy["inventory_quantity"] = int(v_copy.get("inventory_quantity", 0))
-                    updated_variants.append(v_copy)
-                product_update_payload = product_payload.copy()
-                product_update_payload["variants"] = updated_variants
-                url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-                shopify_put(url, {"product": product_update_payload})
-                updated += 1
-                print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
-            else:
-                url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-                res = shopify_post(url, {"product": product_payload})
-                product_id = res.get("product", {}).get("id")
-                if product_id:
-                    created += 1
-                    print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
-                else:
-                    print(f"❌ Failed to create: {product_payload['title']}")
+    for p in items:
+        product_payload = build_product(p)
+        handle = product_payload.get("handle")
+        sku = p.get("sku")
+        barcode = p.get("barcode")
+        title = product_payload.get("title")
+        existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
         
-        time.sleep(1)  # Delay between batches to avoid hitting API limits
+        if existing:
+            sku_map, option_map = _existing_variant_map(existing)
+            updated_variants = []
+            for v in product_payload["variants"]:
+                vid = None
+                v_sku = str(v.get("sku") or "")
+                opt1 = str(v.get("option1") or "")
+                if v_sku and v_sku in sku_map:
+                    vid = sku_map[v_sku]
+                elif opt1 and opt1 in option_map:
+                    vid = option_map[opt1]
+                v_copy = v.copy()
+                if vid:
+                    v_copy["id"] = vid
+                v_copy["price"] = str(v_copy.get("price"))
+                v_copy["inventory_quantity"] = int(v_copy.get("inventory_quantity", 0))
+                updated_variants.append(v_copy)
+            product_update_payload = product_payload.copy()
+            product_update_payload["variants"] = updated_variants
+            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+            shopify_put(url, {"product": product_update_payload})
+            updated += 1
+            print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+        else:
+            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+            res = shopify_post(url, {"product": product_payload})
+            product_id = res.get("product", {}).get("id")
+            if product_id:
+                created += 1
+                print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
+            else:
+                print(f"❌ Failed to create: {product_payload['title']}")
+ 
+        # Adding delay to prevent hitting API rate limits
+        time.sleep(1)  # Adjust as necessary, e.g., 1 second between requests
  
     print("✅ DONE")
     print(f"Created: {created}, Updated: {updated}")
