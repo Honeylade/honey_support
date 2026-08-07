@@ -107,14 +107,20 @@ def shopify_get(url, params=None):
         return {}
  
 def shopify_post(url, data):
-    r = requests.post(url, headers=HEADERS, json=data)
-    if r.status_code not in [200, 201]:
-        print(f"❌ POST ERROR: {r.status_code} - {r.text}")
-    try:
-        return r.json(), int(r.headers.get('X-Shopify-Shop-Api-Call-Limit', '0').split('/')[0])
-    except ValueError:
-        print(f"⚠️ Error parsing response for POST request to {url}: {r.text}")
-        return {}, 0
+    while True:
+        r = requests.post(url, headers=HEADERS, json=data)
+        if r.status_code == 429:  # Rate limit exceeded
+            wait_time = int(r.headers.get('Retry-After', 1))  # Get suggested wait time or default to 1
+            print(f"Rate limit exceeded. Waiting for {wait_time} seconds...")
+            time.sleep(wait_time)
+            continue
+        elif r.status_code not in [200, 201]:
+            print(f"❌ POST ERROR: {r.status_code} - {r.text}")
+        try:
+            return r.json(), int(r.headers.get('X-Shopify-Shop-Api-Call-Limit', '0').split('/')[0])
+        except ValueError:
+            print(f"⚠️ Error parsing response for POST request to {url}: {r.text}")
+            return {}, 0
  
 def shopify_put(url, data):
     r = requests.put(url, headers=HEADERS, json=data)
