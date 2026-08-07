@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import ParseError
 import time
 import concurrent.futures
+from urllib.parse import unquote
  
 # -----------------------------
 # CONFIG (must be defined before functions)
@@ -14,7 +15,8 @@ SHOP_URL = os.getenv("SHOP_URL")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 XML_URL = os.getenv("XML_URL")
 API_VERSION = "2024-01"
-LIMIT = int(os.getenv("LIMIT", "5100"))  # Allow all products = None or 0, default to 250 for batch size
+LIMIT = os.getenv("LIMIT")  # Allow all products = None or 0, default to 250 for batch size
+LIMIT = None if LIMIT in ["None", "0"] else int(LIMIT)
  
 HEADERS = {
     "X-Shopify-Access-Token": ACCESS_TOKEN,
@@ -48,7 +50,7 @@ def last_value(val):
     if not val:
         return ""
     v = val.split(">")[-1].strip()
-    return v.replace("&", "and").replace("&", "and")
+    return unquote(v.replace("&", "and"))
  
 def split_tags(val):
     if not val:
@@ -61,7 +63,7 @@ def sanitize_tags(tags):
     for tag in tags:
         if not tag:
             continue
-        t = tag.replace('&', 'and').strip()
+        t = unquote(tag.replace('&', 'and')).strip()
         t = t[:255] if len(t) > 255 else t
         if t.lower() not in seen:
             seen.add(t.lower())
@@ -75,7 +77,7 @@ def build_description(p):
         if v:
             bullets.append(f"<li>{v}</li>")
     bullet_html = f"<ul>{''.join(bullets)}</ul>" if bullets else ""
-    paragraph = f"<p>{p.get('desc_standard','') or ''}</p>"
+    paragraph = f"<p>{unquote(p.get('desc_standard','') or '')}</p>"
     return bullet_html + paragraph
  
 def valid_image(url):
@@ -134,14 +136,14 @@ def find_product_by_sku_or_barcode(sku=None, barcode=None, title=None):
     if title:
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
         res = shopify_get(url, {"title": title})
-        for p in res.get("products", []) or []:
+        for p in res.get("products", []):
             for v in p.get("variants", []):
                 if (sku and str(v.get("sku")) == str(sku)) or (barcode and v.get("barcode") and v.get("barcode") == barcode):
                     return p
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
     params = {"limit": 250}
     page = shopify_get(url, params=params) or {}
-    for p in page.get("products", []) or []:
+    for p in page.get("products", []):
         for v in p.get("variants", []):
             if (sku and str(v.get("sku")) == str(sku)) or (barcode and v.get("barcode") and v.get("barcode") == barcode):
                 return p
@@ -242,11 +244,12 @@ def load_xml():
         print("ℹ️ Saved raw feed to feed_debug.xml")
     except Exception as e:
         print("⚠️ Couldn't save raw feed:", e)
+ 
     posts = re.findall(r"(?is)<post\b[^>]*?>.*?</post>", raw)
     if posts:
         print(f"🔎 Extracted {len(posts)} <post> blocks from feed (regex fragment parsing).")
         items = []
-        for fragment in posts[:LIMIT]:
+        for fragment in posts[:LIMIT] if LIMIT else posts:
             try:
                 wrapped = f"<root>{fragment}</root>"
                 root = ET.fromstring(wrapped)
@@ -259,15 +262,16 @@ def load_xml():
                 items.append(data)
             except Exception as e:
                 print("⚠️ Failed to parse a <post> fragment:", e)
-        print(f"🔎 Parsed {len(items)} items from <post> fragments (limit {LIMIT}).")
+        print(f"🔎 Parsed {len(items)} items from <post> fragments (limit {LIMIT if LIMIT else 'all'}).")
         if items:
             return items
+ 
     try:
         root = ET.fromstring(raw)
         items_elem = root.findall(".//post")
         print(f"🔎 Found {len(items_elem)} items (full parse).")
         products = []
-        for item in items_elem[:LIMIT]:
+        for item in items_elem[:LIMIT] if LIMIT else items_elem:
             data = {}
             for c in item:
                 data[c.tag.lower()] = c.text
@@ -276,48 +280,7 @@ def load_xml():
             return products
     except ParseError as e:
         print("⚠️ XML ParseError on full parse:", e)
-    try:
-        from bs4 import BeautifulSoup
-        print("🔧 Falling back to BeautifulSoup repair parsing...")
-        soup = BeautifulSoup(raw, "html.parser")
-        posts_bs = soup.find_all(lambda tag: tag.name and tag.name.lower() == "post")
-        print(f"🔎 BeautifulSoup found {len(posts_bs)} post-like elements.")
-        items = []
-        for post in posts_bs[:LIMIT]:
-            data = {}
-            for child in post.find_all(recursive=False):
-                tagname = child.name.lower() if child.name else None
-                data[tagname] = child.get_text() if child else None
-            if not data and post.get_text(strip=True):
-                data["content"] = post.get_text()
-            items.append(data)
-        if items:
-            return items
-    except Exception as e:
-        print("⚠️ BeautifulSoup fallback failed or bs4 missing:", e)
-    print("🔎 Final fallback: heuristic splitting by '<post'...")
-    pieces = re.split(r"(?i)<post\b", raw)
-    candidates = []
-    for piece in pieces[1:LIMIT + 1]:
-        snippet = "<post" + piece
-        m = re.search(r"(?is)<post\b.*?</post>", snippet)
-        if m:
-            fragment = m.group(0)
-            try:
-                wrapped = f"<root>{fragment}</root>"
-                root = ET.fromstring(wrapped)
-                post_elem = root.find(".//post")
-                if post_elem is None:
-                    continue
-                data = {}
-                for c in post_elem:
-                    data[c.tag.lower()] = c.text
-                candidates.append(data)
-            except Exception:
-                continue
-    if candidates:
-        print(f"🔎 Heuristic parsed {len(candidates)} items.")
-        return candidates
+ 
     print("❌ Could not parse feed into <post> items. Check feed_debug.xml for raw content.")
     return []
  
@@ -330,8 +293,9 @@ def process_product(p):
     sku = p.get("sku")
     barcode = p.get("barcode")
     title = product_payload.get("title")
+ 
     existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
-    
+ 
     if existing:
         sku_map, option_map = _existing_variant_map(existing)
         updated_variants = []
@@ -349,6 +313,7 @@ def process_product(p):
             v_copy["price"] = str(v_copy.get("price"))
             v_copy["inventory_quantity"] = int(v_copy.get("inventory_quantity", 0))
             updated_variants.append(v_copy)
+ 
         product_update_payload = product_payload.copy()
         product_update_payload["variants"] = updated_variants
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
@@ -370,7 +335,7 @@ def run_sync():
     items = load_xml()
     created = 0
     updated = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:  # Increased workers for speed
         futures = {executor.submit(process_product, p): p for p in items}
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
@@ -380,7 +345,7 @@ def run_sync():
             elif "Updated" in result:
                 updated += 1
             
-            # Adding delay to prevent hitting API rate limits
+            # Adding delay to prevent hitting API rate limits dynamically
             time.sleep(1)  # Adjust as necessary, e.g., 1 second between requests
  
     print("✅ DONE")
