@@ -106,33 +106,35 @@ def shopify_get(url, params=None):
         print(f"⚠️ Error parsing response for GET request to {url}: {r.text}")
         return {}
  
-def shopify_post(url, data):
-    for attempt in range(5):  # Retry mechanism
-        r = requests.post(url, headers=HEADERS, json=data)
-        if r.status_code == 429:  # Rate limit exceeded
-            wait_time = int(r.headers.get('Retry-After', 1))  # Get suggested wait time or default to 1
-            print(f"Rate limit exceeded. Waiting for {wait_time} seconds...")
-            time.sleep(wait_time)
-            continue
-        elif r.status_code not in [200, 201]:
-            print(f"❌ POST ERROR: {r.status_code} - {r.text}")
-            return {}, 0
-        try:
-            return r.json(), int(r.headers.get('X-Shopify-Shop-Api-Call-Limit', '0').split('/')[0])
-        except ValueError:
-            print(f"⚠️ Error parsing response for POST request to {url}: {r.text}")
-            return {}, 0
+def api_request(method, url, data=None):
+    max_retries = 5
+    retries = 0
  
-def shopify_put(url, data):
-    for attempt in range(5):  # Retry mechanism
-        r = requests.put(url, headers=HEADERS, json=data)
-        if r.status_code not in [200, 201]:
-            print(f"❌ PUT ERROR: {r.status_code} - {r.text}")
+    while retries < max_retries:
         try:
-            return r.json()
-        except ValueError:
-            print(f"⚠️ Error parsing response for PUT request to {url}: {r.text}")
-            return {}
+            if method == 'PUT':
+                response = requests.put(url, headers=HEADERS, json=data)
+            elif method == 'POST':
+                response = requests.post(url, headers=HEADERS, json=data)
+ 
+            if response.status_code in [200, 201]:
+                return response.json()
+            elif response.status_code == 429:
+                print("❌ Rate limit exceeded. Retrying...")
+                wait_time = int(response.headers.get('Retry-After', 1))
+                time.sleep(wait_time)  # Wait based on Retry-After header
+                retries += 1
+                continue
+            else:
+                print(f"❌ Error: {response.status_code} - {response.text}")
+                break
+ 
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ Request failed: {e}")
+            break
+ 
+    print("❌ Max retries reached. Aborting request.")
+    return None
  
 # -----------------------------
 # FIND PRODUCT
@@ -337,15 +339,15 @@ def process_product(p):
         product_update_payload = product_payload.copy()
         product_update_payload["variants"] = updated_variants
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-        res = shopify_put(url, {"product": product_update_payload})
-        if res.get("product"):
+        res = api_request('PUT', url, {"product": product_update_payload})
+        if res and res.get("product"):
             print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
         else:
             print(f"❌ Failed to update: {product_payload['title']} - {res}")
     else:
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-        res, remaining_calls = shopify_post(url, {"product": product_payload})
-        if res.get("product", {}).get("id"):
+        res = api_request('POST', url, {"product": product_payload})
+        if res and res.get("product", {}).get("id"):
             print(f"🆕 Created: {product_payload['title']} (ID: {res['product']['id']})")
         else:
             print(f"❌ Failed to create: {product_payload['title']} - {res}")
@@ -355,21 +357,38 @@ def process_product(p):
 # -----------------------------
 def run_sync():
     print("🚀 START SYNC")
+    
     items = load_xml()
+    
     created = 0
     updated = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:  # Increased workers for speed
-        futures = {executor.submit(process_product, p): p for p in items}
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            print(result)
-            if "Created" in result:
-                created += 1
-            elif "Updated" in result:
+ 
+    for p in items:
+        product_payload = build_product(p)
+        handle = product_payload.get("handle")
+        sku = p.get("sku")
+        barcode = p.get("barcode")
+        title = product_payload.get("title")
+ 
+        existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
+ 
+        if existing:
+            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+            response = api_request('PUT', url, {"product": product_payload})
+            if response:
                 updated += 1
-            
-            # Adding delay to prevent hitting API rate limits dynamically
-            time.sleep(1)  # Adjust as necessary, e.g., 1 second between requests
+                print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+            else:
+                print(f"❌ Failed to update: {product_payload['title']}")
+        else:
+            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+            response = api_request('POST', url, {"product": product_payload})
+            product_id = response.get("product", {}).get("id")
+            if product_id:
+                created += 1
+                print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
+            else:
+                print(f"❌ Failed to create: {product_payload['title']}")
  
     print("✅ DONE")
     print(f"Created: {created}, Updated: {updated}")
