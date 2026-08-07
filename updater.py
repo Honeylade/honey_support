@@ -32,11 +32,11 @@ HEADERS = {
  
 TAGS_TO_INCLUDE = [
     "football accessories", "themed gifts", "Honeylade", "Honey",
-    "sports gifts", "fan accessories", "novelty gifts", "sports fans"
+    "sports gifts", "fan accessories", "novelty gifts", "football", "sports fans"
 ]
  
 # Tune these
-PAGE_LIMIT = 250          # Shopify max per page
+PAGE_LIMIT = 250          # Store max per page
 HTTP_RETRIES = 3
 RETRY_BACKOFF = 1.0       # seconds
  
