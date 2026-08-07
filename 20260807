@@ -4,7 +4,8 @@ import re
 import requests
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import ParseError
-import time  # For adding delays between requests
+import time
+import concurrent.futures
  
 # -----------------------------
 # CONFIG (must be defined before functions)
@@ -47,7 +48,7 @@ def last_value(val):
     if not val:
         return ""
     v = val.split(">")[-1].strip()
-    return v.replace("&amp;", "and").replace("&", "and")
+    return v.replace("&", "and").replace("&", "and")
  
 def split_tags(val):
     if not val:
@@ -105,10 +106,10 @@ def shopify_post(url, data):
     if r.status_code not in [200, 201]:
         print(f"❌ POST ERROR: {r.status_code} - {r.text}")
     try:
-        return r.json()
+        return r.json(), int(r.headers.get('X-Shopify-Shop-Api-Call-Limit', '0').split('/')[0])
     except ValueError:
         print(f"⚠️ Error parsing response for POST request to {url}: {r.text}")
-        return {}
+        return {}, 0
  
 def shopify_put(url, data):
     r = requests.put(url, headers=HEADERS, json=data)
@@ -321,6 +322,47 @@ def load_xml():
     return []
  
 # -----------------------------
+# PROCESS PRODUCT
+# -----------------------------
+def process_product(p):
+    product_payload = build_product(p)
+    handle = product_payload.get("handle")
+    sku = p.get("sku")
+    barcode = p.get("barcode")
+    title = product_payload.get("title")
+    existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
+    
+    if existing:
+        sku_map, option_map = _existing_variant_map(existing)
+        updated_variants = []
+        for v in product_payload["variants"]:
+            vid = None
+            v_sku = str(v.get("sku") or "")
+            opt1 = str(v.get("option1") or "")
+            if v_sku and v_sku in sku_map:
+                vid = sku_map[v_sku]
+            elif opt1 and opt1 in option_map:
+                vid = option_map[opt1]
+            v_copy = v.copy()
+            if vid:
+                v_copy["id"] = vid
+            v_copy["price"] = str(v_copy.get("price"))
+            v_copy["inventory_quantity"] = int(v_copy.get("inventory_quantity", 0))
+            updated_variants.append(v_copy)
+        product_update_payload = product_payload.copy()
+        product_update_payload["variants"] = updated_variants
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+        shopify_put(url, {"product": product_update_payload})
+        return f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})"
+    else:
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+        res, remaining_calls = shopify_post(url, {"product": product_payload})
+        if res.get("product", {}).get("id"):
+            return f"🆕 Created: {product_payload['title']} (ID: {res['product']['id']})"
+        else:
+            return f"❌ Failed to create: {product_payload['title']}"
+ 
+# -----------------------------
 # SYNC
 # -----------------------------
 def run_sync():
@@ -328,49 +370,18 @@ def run_sync():
     items = load_xml()
     created = 0
     updated = 0
-    for p in items:
-        product_payload = build_product(p)
-        handle = product_payload.get("handle")
-        sku = p.get("sku")
-        barcode = p.get("barcode")
-        title = product_payload.get("title")
-        existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
-        
-        if existing:
-            sku_map, option_map = _existing_variant_map(existing)
-            updated_variants = []
-            for v in product_payload["variants"]:
-                vid = None
-                v_sku = str(v.get("sku") or "")
-                opt1 = str(v.get("option1") or "")
-                if v_sku and v_sku in sku_map:
-                    vid = sku_map[v_sku]
-                elif opt1 and opt1 in option_map:
-                    vid = option_map[opt1]
-                v_copy = v.copy()
-                if vid:
-                    v_copy["id"] = vid
-                v_copy["price"] = str(v_copy.get("price"))
-                v_copy["inventory_quantity"] = int(v_copy.get("inventory_quantity", 0))
-                updated_variants.append(v_copy)
-            product_update_payload = product_payload.copy()
-            product_update_payload["variants"] = updated_variants
-            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-            shopify_put(url, {"product": product_update_payload})
-            updated += 1
-            print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
-        else:
-            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-            res = shopify_post(url, {"product": product_payload})
-            product_id = res.get("product", {}).get("id")
-            if product_id:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(process_product, p): p for p in items}
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            print(result)
+            if "Created" in result:
                 created += 1
-                print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
-            else:
-                print(f"❌ Failed to create: {product_payload['title']}")
- 
-        # Adding delay to prevent hitting API rate limits
-        time.sleep(1)  # Adjust as necessary, e.g., 1 second between requests
+            elif "Updated" in result:
+                updated += 1
+            
+            # Adding delay to prevent hitting API rate limits
+            time.sleep(1)  # Adjust as necessary, e.g., 1 second between requests
  
     print("✅ DONE")
     print(f"Created: {created}, Updated: {updated}")
