@@ -107,7 +107,7 @@ def shopify_get(url, params=None):
         return {}
  
 def shopify_post(url, data):
-    while True:
+    for attempt in range(5):  # Retry mechanism
         r = requests.post(url, headers=HEADERS, json=data)
         if r.status_code == 429:  # Rate limit exceeded
             wait_time = int(r.headers.get('Retry-After', 1))  # Get suggested wait time or default to 1
@@ -116,6 +116,7 @@ def shopify_post(url, data):
             continue
         elif r.status_code not in [200, 201]:
             print(f"❌ POST ERROR: {r.status_code} - {r.text}")
+            return {}, 0
         try:
             return r.json(), int(r.headers.get('X-Shopify-Shop-Api-Call-Limit', '0').split('/')[0])
         except ValueError:
@@ -123,14 +124,15 @@ def shopify_post(url, data):
             return {}, 0
  
 def shopify_put(url, data):
-    r = requests.put(url, headers=HEADERS, json=data)
-    if r.status_code not in [200, 201]:
-        print(f"❌ PUT ERROR: {r.status_code} - {r.text}")
-    try:
-        return r.json()
-    except ValueError:
-        print(f"⚠️ Error parsing response for PUT request to {url}: {r.text}")
-        return {}
+    for attempt in range(5):  # Retry mechanism
+        r = requests.put(url, headers=HEADERS, json=data)
+        if r.status_code not in [200, 201]:
+            print(f"❌ PUT ERROR: {r.status_code} - {r.text}")
+        try:
+            return r.json()
+        except ValueError:
+            print(f"⚠️ Error parsing response for PUT request to {url}: {r.text}")
+            return {}
  
 # -----------------------------
 # FIND PRODUCT
@@ -198,6 +200,7 @@ def build_product(p):
     sizes = [s.strip() for s in re.split(r"[|,]+", sizes_raw) if s.strip()]
     stock_qty = int(p.get("stock") or 0)
     barcode = p.get("barcode") if p.get("barcode") else None
+ 
     if sizes:
         for s in sizes:
             variants.append({
@@ -222,6 +225,7 @@ def build_product(p):
             "weight": weight,
             "weight_unit": "g"
         })
+ 
     product = {
         "title": title,
         "body_html": description,
@@ -303,6 +307,7 @@ def process_product(p):
     barcode = p.get("barcode")
     title = product_payload.get("title")
  
+    # Check for existing product using handle or SKU/barcode
     existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
  
     if existing:
@@ -326,15 +331,18 @@ def process_product(p):
         product_update_payload = product_payload.copy()
         product_update_payload["variants"] = updated_variants
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-        shopify_put(url, {"product": product_update_payload})
-        return f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})"
+        res = shopify_put(url, {"product": product_update_payload})
+        if res.get("product"):
+            print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+        else:
+            print(f"❌ Failed to update: {product_payload['title']} - {res}")
     else:
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
         res, remaining_calls = shopify_post(url, {"product": product_payload})
         if res.get("product", {}).get("id"):
-            return f"🆕 Created: {product_payload['title']} (ID: {res['product']['id']})"
+            print(f"🆕 Created: {product_payload['title']} (ID: {res['product']['id']})")
         else:
-            return f"❌ Failed to create: {product_payload['title']}"
+            print(f"❌ Failed to create: {product_payload['title']} - {res}")
  
 # -----------------------------
 # SYNC
