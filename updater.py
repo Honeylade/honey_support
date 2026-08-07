@@ -315,6 +315,9 @@ def process_product(p):
     barcode = p.get("barcode")
     title = product_payload.get("title")
  
+    # Log tags for debugging
+    print(f"Tags being sent for {title}: {product_payload.get('tags')}")
+ 
     # Check for existing product using handle or SKU/barcode
     existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
  
@@ -351,7 +354,6 @@ def process_product(p):
             print(f"🆕 Created: {product_payload['title']} (ID: {res['product']['id']})")
         else:
             print(f"❌ Failed to create: {product_payload['title']} - {res}")
- 
 # -----------------------------
 # SYNC
 # -----------------------------
