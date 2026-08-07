@@ -15,8 +15,11 @@ SHOP_URL = os.getenv("SHOP_URL")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 XML_URL = os.getenv("XML_URL")
 API_VERSION = "2024-01"
-LIMIT = os.getenv("LIMIT")  # Allow all products = None or 0, default to 250 for batch size
-LIMIT = None if LIMIT in ["None", "0"] else int(LIMIT)
+LIMIT = os.getenv("LIMIT")  # Allow all products = None or 0
+if LIMIT in ["None", "0", None]:
+    LIMIT = None
+else:
+    LIMIT = int(LIMIT)
  
 HEADERS = {
     "X-Shopify-Access-Token": ACCESS_TOKEN,
