@@ -322,38 +322,26 @@ def process_product(p):
     existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
  
     if existing:
-        sku_map, option_map = _existing_variant_map(existing)
-        updated_variants = []
-        for v in product_payload["variants"]:
-            vid = None
-            v_sku = str(v.get("sku") or "")
-            opt1 = str(v.get("option1") or "")
-            if v_sku and v_sku in sku_map:
-                vid = sku_map[v_sku]
-            elif opt1 and opt1 in option_map:
-                vid = option_map[opt1]
-            v_copy = v.copy()
-            if vid:
-                v_copy["id"] = vid
-            v_copy["price"] = str(v_copy.get("price"))
-            v_copy["inventory_quantity"] = int(v_copy.get("inventory_quantity", 0))
-            updated_variants.append(v_copy)
- 
-        product_update_payload = product_payload.copy()
-        product_update_payload["variants"] = updated_variants
+        # Update existing product
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-        res = api_request('PUT', url, {"product": product_update_payload})
-        if res and res.get("product"):
+        response = api_request('PUT', url, {"product": product_payload})
+        if response:
             print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+            return "updated"
         else:
-            print(f"❌ Failed to update: {product_payload['title']} - {res}")
+            print(f"❌ Failed to update: {product_payload['title']}")
+            return "failed"
     else:
+        # Create new product
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-        res = api_request('POST', url, {"product": product_payload})
-        if res and res.get("product", {}).get("id"):
-            print(f"🆕 Created: {product_payload['title']} (ID: {res['product']['id']})")
+        response = api_request('POST', url, {"product": product_payload})
+        product_id = response.get("product", {}).get("id")
+        if product_id:
+            print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
+            return "created"
         else:
-            print(f"❌ Failed to create: {product_payload['title']} - {res}")
+            print(f"❌ Failed to create: {product_payload['title']}")
+            return "failed"
  
 # -----------------------------
 # SYNC
@@ -367,37 +355,15 @@ def run_sync():
     updated = 0
     
     # Process products in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:  # Adjust to handle rate limits
         futures = {executor.submit(process_product, p): p for p in items}
         for future in concurrent.futures.as_completed(futures):
             try:
-                product_payload = build_product(futures[future])
-                handle = product_payload.get("handle")
-                sku = futures[future].get("sku")
-                barcode = futures[future].get("barcode")
-                title = product_payload.get("title")
-                
-                # Check for existing product
-                existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
- 
-                if existing:
-                    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-                    response = api_request('PUT', url, {"product": product_payload})
-                    if response:
-                        updated += 1
-                        print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
-                    else:
-                        print(f"❌ Failed to update: {product_payload['title']}")
-                else:
-                    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-                    response = api_request('POST', url, {"product": product_payload})
-                    product_id = response.get("product", {}).get("id")
-                    if product_id:
-                        created += 1
-                        print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
-                    else:
-                        print(f"❌ Failed to create: {product_payload['title']}")
- 
+                result = future.result()
+                if result == "created":
+                    created += 1
+                elif result == "updated":
+                    updated += 1
             except Exception as e:
                 print(f"⚠️ Error processing product: {e}")
  
