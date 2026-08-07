@@ -338,132 +338,116 @@ def existing_variant_map(prod):
         if opt1:  opt_map[opt1] = vid
     return sku_map, opt_map
  
-# -----------------------------
-# MAIN SYNC
-# -----------------------------
-def run_sync():
-    if not SHOP_URL or not ACCESS_TOKEN or not XML_URL:
-        print("❌ Missing SHOP_URL/ACCESS_TOKEN/XML_URL")
-        return
+    # -----------------------------
+    # Main sync loop
+    # -----------------------------
+    def run_sync():
+        if not SHOP_URL or not ACCESS_TOKEN or not XML_URL:
+            print("❌ Missing SHOP_URL/ACCESS_TOKEN/XML_URL")
+            return
  
-    items = load_xml()
-    if not items:
-        print("❌ No items.")
-        return
+        items = load_xml()
+        if not items:
+            print("❌ No items parsed from feed.")
+            return
  
-    handle_map, sku_map, barcode_map = build_store_index()
-    created, updated = 0, 0
+        handle_map, sku_map, barcode_map = build_store_index()
+        created, updated = 0, 0
  
-    for p in items:
-        payload = build_product_payload(p)
-        handle  = payload["handle"]
-        sku     = (p.get("sku") or "").strip()
-        bc      = p.get("barcode") or None
+        for p in items:
+            payload = build_product_payload(p)
+            handle  = payload["handle"]
+            sku     = (p.get("sku") or "").strip()
+            bc      = p.get("barcode") or None
  
-        # match existing
-        existing = (
-            sku_map.get(sku) or
-            barcode_map.get(bc)  or
-            handle_map.get(handle)
-        )
-        if not existing:
-            # last resort: title search
-            res = safe_get(
-                f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json",
-                params={"title": payload["title"]}
-            )
-            for cand in res.get("products", []):
-                # check its variants
-                for v in cand.get("variants", []):
-                    if (sku and str(v.get("sku"))==sku) or (bc and v.get("barcode")==bc):
-                        existing = cand
+            # find existing by SKU, barcode, handle, then title-search fallback
+            existing = sku_map.get(sku) or barcode_map.get(bc) or handle_map.get(handle)
+            if not existing:
+                # title search
+                res_search = safe_get(
+                    f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json",
+                    params={"title": payload["title"]}
+                )
+                for cand in res_search.get("products", []) or []:
+                    for v in cand.get("variants", []) or []:
+                        if (sku and str(v.get("sku")) == sku) or (bc and v.get("barcode") == bc):
+                            existing = cand
+                            break
+                    if existing:
                         break
-                if existing:
-                    break
  
-        if existing:
-            # UPDATE
-            vid_map, opt_map = existing_variant_map(existing)
-            upd_vars = []
-            for v in payload["variants"]:
-                key_sku = v.get("sku","")
-                key_opt = v.get("option1","")
-                vid = vid_map.get(key_sku) or opt_map.get(key_opt)
-                var = {
-                    **({"id": vid} if vid else {}),
-                    "price":                v["price"],
-                    "sku":                  v.get("sku",""),
-                    "inventory_quantity":   int(v.get("inventory_quantity",0)),
-                    "inventory_management": v.get("inventory_management"),
-                    "barcode":              v.get("barcode"),
-                    "weight":               v.get("weight"),
-                    "weight_unit":          v.get("weight_unit"),
+            if existing:
+                # UPDATE path
+                vid_map, opt_map = existing_variant_map(existing)
+                upd_vars = []
+                for v in payload["variants"]:
+                    key_sku = v.get("sku", "")
+                    key_opt = v.get("option1", "")
+                    vid = vid_map.get(key_sku) or opt_map.get(key_opt)
+                    var = {
+                        **({"id": vid} if vid else {}),
+                        "price":              v["price"],
+                        "sku":                v.get("sku", ""),
+                        "inventory_quantity": int(v.get("inventory_quantity", 0)),
+                        "inventory_management": v.get("inventory_management"),
+                        "barcode":            v.get("barcode"),
+                        "weight":             v.get("weight"),
+                        "weight_unit":        v.get("weight_unit"),
+                    }
+                    # drop None-valued keys
+                    var = {k: vv for k, vv in var.items() if vv is not None}
+                    upd_vars.append(var)
+ 
+                body = {
+                    "title":        payload["title"],
+                    "body_html":    payload["body_html"],
+                    "vendor":       payload["vendor"],
+                    "product_type": payload["product_type"],
+                    "tags":         payload["tags"],
+                    "variants":     upd_vars,
                 }
-                # drop Nones
-                var = {k:vv for k,vv in var.items() if vv is not None}
-                upd_vars.append(var)
+                if payload.get("images"):
+                    body["images"] = payload["images"]
  
-            body = {
-                "title":       payload["title"],
-                "body_html":   payload["body_html"],
-                "vendor":      payload["vendor"],
-                "product_type":payload["product_type"],
-                "tags":        payload["tags"],
-                "variants":    upd_vars,
-            }
-            if payload.get("images"):
-                body["images"] = payload["images"]
- 
-            res = safe_put(
-                f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json",
-                {"product": body}
-            )
-            if res.get("product"):
-                updated += 1
-                print(f"🔄 Updated {payload['title']} (ID {existing['id']})")
-                # refresh maps
-                prod = res["product"]
-                handle_map[prod["handle"]] = prod
-                for v in prod.get("variants", []):
-                    sku_map[str(v.get("sku") or "")] = prod
-                    bc2 = v.get("barcode")
-                    if bc2:
-                        barcode_map[bc2] = prod
+                res = safe_put(
+                    f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json",
+                    {"product": body}
+                )
+                if res.get("product"):
+                    updated += 1
+                    print(f"🔄 Updated {payload['title']} (ID {existing['id']})")
+                    # refresh maps
+                    prod = res["product"]
+                    handle_map[prod["handle"]] = prod
+                    for v in prod.get("variants", []) or []:
+                        sku_map[str(v.get("sku") or "")] = prod
+                        bc2 = v.get("barcode")
+                        if bc2:
+                            barcode_map[bc2] = prod
+                else:
+                    print(f"❌ Update failed: {payload['title']}")
             else:
-                print(f"❌ Update failed: {payload['title']}")
-        else:
-            # CREATE
-            res = safe_post(
-                f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json",
-                {"product": payload}
-            )
-            prod = res.get("product") or {}
-            pid = prod.get("id")
-            if pid:
-                created += 1
-                print(f"🆕 Created {payload['title']} (ID {pid})")
-                handle_map[prod["handle"]] = prod
-                for v in prod.get("variants", []):
-                    sku_map[str(v.get("sku") or "")] = prod
-                    bc2 = v.get("barcode")
-                    if bc2:
-                        barcode_map[bc2] = prod
-            else:
-                print(f"❌ Create failed: {payload['title']}")
+                # CREATE path
+                res = safe_post(
+                    f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json",
+                    {"product": payload}
+                )
+                prod = res.get("product") or {}
+                pid = prod.get("id")
+                if pid:
+                    created += 1
+                    print(f"🆕 Created {payload['title']} (ID {pid})")
+                    handle_map[prod["handle"]] = prod
+                    for v in prod.get("variants", []) or []:
+                        sku_map[str(v.get("sku") or "")] = prod
+                        bc2 = v.get("barcode")
+                        if bc2:
+                            barcode_map[bc2] = prod
+                else:
+                    print(f"❌ Create failed: {payload['title']}")
  
-        # throttle
-        time.sleep(0.5)
+            # throttle to avoid rate limits
+            time.sleep(0.5)
  
-    print("✅ DONE")
-    print(f"Created: {created}, Updated: {updated}")
- 
-# -----------------------------
-# RUN
-# -----------------------------
-if __name__ == "__main__":
-    start = time.time()
-    try:
-        run_sync()
-    except Exception as e:
-        print("Fatal:", e)
-    print(f"⏱ Elapsed: {time.time()-start:.1f}s")
+        print("✅ DONE")
+        print(f"Created: {created}, Updated: {updated}")
