@@ -53,7 +53,7 @@ def last_value(val):
     if not val:
         return ""
     v = val.split(">")[-1].strip()
-    return unquote(v.replace("&", "and"))
+    return unquote(v.replace("&amp;", "and"))
  
 def split_tags(val):
     if not val:
@@ -66,7 +66,7 @@ def sanitize_tags(tags):
     for tag in tags:
         if not tag:
             continue
-        t = unquote(tag.replace('&', 'and')).strip()
+        t = unquote(tag.replace('&amp;', 'and')).strip()  # Handle '&amp;' properly
         t = t[:255] if len(t) > 255 else t
         if t.lower() not in seen:
             seen.add(t.lower())
@@ -78,7 +78,7 @@ def build_description(p):
     for i in range(1, 11):
         v = p.get(f"desc_{i}")
         if v:
-            bullets.append(f"<li>{v}</li>")
+            bullets.append(f"<li>{unquote(v)}</li>")
     bullet_html = f"<ul>{''.join(bullets)}</ul>" if bullets else ""
     paragraph = f"<p>{unquote(p.get('desc_standard','') or '')}</p>"
     return bullet_html + paragraph
