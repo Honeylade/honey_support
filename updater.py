@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""
+Improved Shopify sync:
+- Builds local index of existing store products (handle, sku, barcode -> product)
+- Avoids recreating already-existing products
+- Updates existing products' variants preserving variant IDs
+- Safer parsing and retries
+"""
+ 
 import os
 import re
 import time
@@ -32,11 +40,11 @@ HEADERS = {
  
 TAGS_TO_INCLUDE = [
     "football accessories", "themed gifts", "Honeylade", "Honey",
-    "sports gifts", "fan accessories", "novelty gifts", "football", "sports fans"
+    "sports gifts", "fan accessories", "novelty gifts", "sports fans"
 ]
  
 # Tune these
-PAGE_LIMIT = 250          # Store max per page
+PAGE_LIMIT = 250          # Shopify max per page
 HTTP_RETRIES = 3
 RETRY_BACKOFF = 1.0       # seconds
  
@@ -450,4 +458,51 @@ def run_sync():
             else:
                 print(f"❌ Failed to update: {product_payload['title']}")
             # keep maps in sync: update sku_map/barcode_map if necessary
-            for v in res.get("product", {}).get("
+            for v in res.get("product", {}).get("variants", []) or []:
+                sku_val = str(v.get("sku") or "")
+                barcode_val = v.get("barcode")
+                if sku_val:
+                    sku_map[sku_val] = res.get("product")
+                if barcode_val:
+                    barcode_map[barcode_val] = res.get("product")
+            if res.get("product") and res["product"].get("handle"):
+                handle_map[res["product"]["handle"]] = res["product"]
+        else:
+            # create new product
+            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+            res = safe_post(url, {"product": product_payload})
+            product_id = res.get("product", {}).get("id")
+            if product_id:
+                created += 1
+                print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
+                # update index maps
+                created_product = res.get("product")
+                if created_product.get("handle"):
+                    handle_map[created_product["handle"]] = created_product
+                for v in created_product.get("variants", []) or []:
+                    sku_val = str(v.get("sku") or "")
+                    barcode_val = v.get("barcode")
+                    if sku_val:
+                        sku_map[sku_val] = created_product
+                    if barcode_val:
+                        barcode_map[barcode_val] = created_product
+            else:
+                print(f"❌ Failed to create: {product_payload['title']}")
+ 
+        # gentle pacing to avoid throttling
+        time.sleep(0.6)  # ~1-2 requests per second; tune as needed
+ 
+    print("✅ DONE")
+    print(f"Created: {created}, Updated: {updated}")
+ 
+# -----------------------------
+# Run
+# -----------------------------
+if __name__ == "__main__":
+    start = time.time()
+    try:
+        run_sync()
+    except Exception as exc:
+        print("Fatal error:", exc)
+    elapsed = time.time() - start
+    print(f"⏱ Elapsed: {elapsed:.1f}s")
