@@ -251,6 +251,8 @@ def load_xml():
     r.raise_for_status()
     raw_bytes = r.content
     raw = raw_bytes.decode('utf-8', errors='replace')
+    
+    # Save the raw feed for debugging
     try:
         with open("feed_debug.xml", "wb") as f:
             f.write(raw_bytes)
@@ -259,40 +261,44 @@ def load_xml():
         print("⚠️ Couldn't save raw feed:", e)
  
     posts = re.findall(r"(?is)<post\b[^>]*?>.*?</post>", raw)
+    items = []
+    
     if posts:
         print(f"🔎 Extracted {len(posts)} <post> blocks from feed (regex fragment parsing).")
-        items = []
         for fragment in posts[:LIMIT] if LIMIT else posts:
             try:
                 wrapped = f"<root>{fragment}</root>"
                 root = ET.fromstring(wrapped)
                 post_elem = root.find(".//post")
                 if post_elem is None:
+                    print("⚠️ No <post> element found in fragment.")
                     continue
-                data = {}
-                for c in post_elem:
-                    data[c.tag.lower()] = c.text
+                data = {c.tag.lower(): c.text for c in post_elem}
                 items.append(data)
+            except ET.ParseError as e:
+                print(f"⚠️ Failed to parse a <post> fragment: {e}. Fragment: {fragment[:100]}...")  # Show part of the fragment for context
             except Exception as e:
-                print("⚠️ Failed to parse a <post> fragment:", e)
+                print(f"⚠️ Unexpected error: {e}")
+ 
         print(f"🔎 Parsed {len(items)} items from <post> fragments (limit {LIMIT if LIMIT else 'all'}).")
         if items:
             return items
  
+    # Full XML parsing as a fallback
     try:
         root = ET.fromstring(raw)
         items_elem = root.findall(".//post")
         print(f"🔎 Found {len(items_elem)} items (full parse).")
         products = []
         for item in items_elem[:LIMIT] if LIMIT else items_elem:
-            data = {}
-            for c in item:
-                data[c.tag.lower()] = c.text
+            data = {c.tag.lower(): c.text for c in item}
             products.append(data)
         if products:
             return products
-    except ParseError as e:
-        print("⚠️ XML ParseError on full parse:", e)
+    except ET.ParseError as e:
+        print(f"⚠️ XML ParseError on full parse: {e}. Check the XML structure.")
+    except Exception as e:
+        print(f"⚠️ Unexpected error during full parse: {e}")
  
     print("❌ Could not parse feed into <post> items. Check feed_debug.xml for raw content.")
     return []
