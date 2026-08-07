@@ -1,113 +1,54 @@
 #!/usr/bin/env python3
-"""
-Improved Shopify sync:
-- Builds a local index of existing store products (handle, SKU, barcode → product)
-- Avoids recreating already-existing products
-- Updates existing products’ variants preserving variant IDs
-- Retries on transient HTTP errors
-"""
- 
 import os
 import re
-import time
 import requests
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import ParseError
-from requests.adapters import HTTPAdapter, Retry
+import time
+import concurrent.futures
  
 # -----------------------------
-# CONFIG
+# CONFIG (must be defined before functions)
 # -----------------------------
-SHOP_URL     = os.getenv("SHOP_URL")
+SHOP_URL = os.getenv("SHOP_URL")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
-XML_URL      = os.getenv("XML_URL")
-API_VERSION  = os.getenv("API_VERSION", "2024-01")
- 
-_raw_limit = os.getenv("LIMIT", "").strip()
-if _raw_limit == "" or _raw_limit.lower() in ("0", "none", "null"):
-    LIMIT = None
-else:
-    try:
-        LIMIT = int(_raw_limit)
-    except ValueError:
-        LIMIT = None
+XML_URL = os.getenv("XML_URL")
+API_VERSION = "2024-01"
+LIMIT = int(os.getenv("LIMIT", "5100"))  # Allow all products = None or 0, default to 250 for batch size
  
 HEADERS = {
     "X-Shopify-Access-Token": ACCESS_TOKEN,
-    "Content-Type":        "application/json",
-    "Accept":              "application/json",
+    "Content-Type": "application/json",
+    "Accept": "application/json"
 }
  
-TAGS_TO_INCLUDE = [
-    "football accessories", "themed gifts", "Honeylade", "Honey",
-    "sports gifts", "fan accessories", "novelty gifts", "sports fans",
-]
- 
-# Shopify pagination / retry params
-PAGE_LIMIT   = 250
-HTTP_RETRIES = 3
-BACKOFF      = 1.0  # seconds
+TAGS_TO_INCLUDE = ["football accessories", "themed gifts", "Honeylade", "Honey", "sports gifts", "fan accessories", "novelty gifts", "sports fans"]
  
 # -----------------------------
-# SESSION WITH RETRIES
+# PRICE LOGIC
 # -----------------------------
-session = requests.Session()
-retries = Retry(
-    total=HTTP_RETRIES,
-    backoff_factor=BACKOFF,
-    status_forcelist=(429, 500, 502, 503, 504)
-)
-session.mount("https://", HTTPAdapter(max_retries=retries))
-session.headers.update(HEADERS)
- 
-def safe_get(url, params=None):
-    r = session.get(url, params=params, timeout=60)
-    r.raise_for_status()
-    try:
-        return r.json()
-    except ValueError:
-        return {}
- 
-def safe_post(url, json_data):
-    r = session.post(url, json=json_data, timeout=60)
-    try:
-        r.raise_for_status()
-        return r.json()
-    except requests.HTTPError:
-        print(f"❌ POST {r.status_code} {r.text[:300]}")
-        return {}
- 
-def safe_put(url, json_data):
-    r = session.put(url, json=json_data, timeout=60)
-    try:
-        r.raise_for_status()
-        return r.json()
-    except requests.HTTPError:
-        print(f"❌ PUT {r.status_code} {r.text[:300]}")
-        return {}
+def calc_price(cost, weight):
+    cost = float(cost or 0)
+    weight = float(weight or 0)
+    shipping = 3.99 if weight < 300 else 4.99 if weight < 2000 else 18
+    margin = 0.30 if cost < 5 else 0.25 if cost < 10 else 0.20
+    TAX = 0.20
+    FEES = 0.029 + 0.090
+    FIXED_COSTS = 0.30 + 0.50
+    base_price = cost * (1 + margin)
+    taxed_price = base_price * (1 + TAX)
+    price_after_fees = taxed_price / (1 - FEES)
+    final_price = price_after_fees + shipping + FIXED_COSTS
+    return round(final_price, 2)
  
 # -----------------------------
 # HELPERS
 # -----------------------------
-def calc_price(cost, weight):
-    cost   = float(cost or 0)
-    weight = float(weight or 0)
-    shipping = 3.99 if weight < 300 else 4.99 if weight < 2000 else 18
-    margin   = 0.30 if cost < 5 else 0.25 if cost < 10 else 0.20
-    TAX       = 0.20
-    FEES      = 0.029 + 0.090
-    FIXED     = 0.30 + 0.50
-    base    = cost * (1 + margin)
-    taxed   = base * (1 + TAX)
-    denom   = (1 - FEES) if (1 - FEES) != 0 else 1
-    priced  = taxed / denom
-    return round(priced + shipping + FIXED, 2)
- 
 def last_value(val):
     if not val:
         return ""
     v = val.split(">")[-1].strip()
-    return v.replace("&amp;", "and").replace("&", "and")
+    return v.replace("&", "and").replace("&", "and")
  
 def split_tags(val):
     if not val:
@@ -115,16 +56,17 @@ def split_tags(val):
     return [t.strip() for t in re.split(r"[>\|,;/\s]+", val) if t.strip()]
  
 def sanitize_tags(tags):
+    sanitized = []
     seen = set()
-    out  = []
-    for t in tags:
-        if not t:
+    for tag in tags:
+        if not tag:
             continue
-        norm = t.replace("&", "and").strip()[:255]
-        if norm.lower() not in seen:
-            seen.add(norm.lower())
-            out.append(norm)
-    return out
+        t = tag.replace('&', 'and').strip()
+        t = t[:255] if len(t) > 255 else t
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            sanitized.append(t)
+    return sanitized
  
 def build_description(p):
     bullets = []
@@ -132,37 +74,102 @@ def build_description(p):
         v = p.get(f"desc_{i}")
         if v:
             bullets.append(f"<li>{v}</li>")
-    html_list = f"<ul>{''.join(bullets)}</ul>" if bullets else ""
-    para      = f"<p>{p.get('desc_standard','') or ''}</p>"
-    return html_list + para
+    bullet_html = f"<ul>{''.join(bullets)}</ul>" if bullets else ""
+    paragraph = f"<p>{p.get('desc_standard','') or ''}</p>"
+    return bullet_html + paragraph
  
 def valid_image(url):
-    if not url: return False
-    u = url.strip()
-    if not (u.startswith("http://") or u.startswith("https://")): return False
-    if " " in u: return False
-    for ext in (".jpg",".jpeg",".png",".webp"):
-        if u.lower().endswith(ext) or ext in u.lower():
-            return True
-    return False
+    if not url:
+        return False
+    url = url.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False
+    if " " in url:
+        return False
+    if not any(url.lower().endswith(ext) or ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+        return False
+    return True
  
 # -----------------------------
-# BUILD PAYLOAD
+# SHOPIFY WRAPPERS
 # -----------------------------
-def build_product_payload(p):
+def shopify_get(url, params=None):
+    r = requests.get(url, headers=HEADERS, params=params)
+    try:
+        return r.json() if r.status_code == 200 else {}
+    except ValueError:
+        print(f"⚠️ Error parsing response for GET request to {url}: {r.text}")
+        return {}
+ 
+def shopify_post(url, data):
+    r = requests.post(url, headers=HEADERS, json=data)
+    if r.status_code not in [200, 201]:
+        print(f"❌ POST ERROR: {r.status_code} - {r.text}")
+    try:
+        return r.json(), int(r.headers.get('X-Shopify-Shop-Api-Call-Limit', '0').split('/')[0])
+    except ValueError:
+        print(f"⚠️ Error parsing response for POST request to {url}: {r.text}")
+        return {}, 0
+ 
+def shopify_put(url, data):
+    r = requests.put(url, headers=HEADERS, json=data)
+    if r.status_code not in [200, 201]:
+        print(f"❌ PUT ERROR: {r.status_code} - {r.text}")
+    try:
+        return r.json()
+    except ValueError:
+        print(f"⚠️ Error parsing response for PUT request to {url}: {r.text}")
+        return {}
+ 
+# -----------------------------
+# FIND PRODUCT
+# -----------------------------
+def find_product_by_handle(handle):
+    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+    res = shopify_get(url, {"handle": handle})
+    products = res.get("products") or []
+    return products[0] if products else None
+ 
+def find_product_by_sku_or_barcode(sku=None, barcode=None, title=None):
+    if title:
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+        res = shopify_get(url, {"title": title})
+        for p in res.get("products", []) or []:
+            for v in p.get("variants", []):
+                if (sku and str(v.get("sku")) == str(sku)) or (barcode and v.get("barcode") and v.get("barcode") == barcode):
+                    return p
+    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+    params = {"limit": 250}
+    page = shopify_get(url, params=params) or {}
+    for p in page.get("products", []) or []:
+        for v in p.get("variants", []):
+            if (sku and str(v.get("sku")) == str(sku)) or (barcode and v.get("barcode") and v.get("barcode") == barcode):
+                return p
+    return None
+ 
+def _existing_variant_map(existing_product):
+    sku_map = {}
+    option_map = {}
+    for v in existing_product.get("variants", []):
+        vid = v.get("id")
+        sku = str(v.get("sku") or "")
+        opt1 = str(v.get("option1") or "")
+        if sku:
+            sku_map[sku] = vid
+        if opt1:
+            option_map[opt1] = vid
+    return sku_map, option_map
+ 
+# -----------------------------
+# BUILD PRODUCT PAYLOAD
+# -----------------------------
+def build_product(p):
     title = p.get("title") or f"Product-{p.get('sku')}"
-    handle = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
-    try:
-        cost   = float(p.get("costprice") or 0)
-    except:
-        cost = 0
-    try:
-        weight = float(p.get("weight") or 0)
-    except:
-        weight = 0
- 
+    handle = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
+    cost = float(p.get("costprice") or 0)
+    weight = float(p.get("weight") or 0)
     price = calc_price(cost, weight)
-    vendor       = last_value(p.get("productbrand"))
+    vendor = last_value(p.get("productbrand"))
     product_type = last_value(p.get("productrange"))
     tags = (
         split_tags(p.get("productbrand")) +
@@ -170,31 +177,23 @@ def build_product_payload(p):
         TAGS_TO_INCLUDE +
         split_tags(title)
     )
-    tags        = sanitize_tags(tags)
+    tags = sanitize_tags(tags)
     description = build_description(p)
- 
-    # Images
-    imgs = []
-    for src in re.split(r"[|,]+", p.get("imageoffloads") or ""):
-        if valid_image(src):
-            imgs.append({"src": src.strip()})
- 
-    # Variants
+    raw_images = (p.get("imageoffloads") or "")
+    raw_images = re.split(r"[|,]+", raw_images)
+    images = [{"src": img.strip()} for img in raw_images if valid_image(img)]
     variants = []
-    sizes = [s.strip() for s in re.split(r"[|,]+", p.get("sizeattribute") or "") if s.strip()]
-    try:
-        stock = int(p.get("stock") or 0)
-    except:
-        stock = 0
-    barcode = p.get("barcode") or None
- 
+    sizes_raw = (p.get("sizeattribute") or "")
+    sizes = [s.strip() for s in re.split(r"[|,]+", sizes_raw) if s.strip()]
+    stock_qty = int(p.get("stock") or 0)
+    barcode = p.get("barcode") if p.get("barcode") else None
     if sizes:
         for s in sizes:
             variants.append({
                 "option1": s,
                 "price": str(price),
-                "sku": p.get("sku",""),
-                "inventory_quantity": stock,
+                "sku": p.get("sku"),
+                "inventory_quantity": int(stock_qty),
                 "inventory_management": "shopify",
                 "cost": cost,
                 "barcode": barcode,
@@ -204,15 +203,14 @@ def build_product_payload(p):
     else:
         variants.append({
             "price": str(price),
-            "sku": p.get("sku",""),
-            "inventory_quantity": stock,
+            "sku": p.get("sku"),
+            "inventory_quantity": int(stock_qty),
             "inventory_management": "shopify",
             "cost": cost,
             "barcode": barcode,
             "weight": weight,
             "weight_unit": "g"
         })
- 
     product = {
         "title": title,
         "body_html": description,
@@ -220,234 +218,176 @@ def build_product_payload(p):
         "product_type": product_type,
         "tags": ", ".join(tags),
         "handle": handle,
-        "status": "active" if stock > 0 else "draft",
-        "published": True if stock > 0 else False,
+        "status": "active" if stock_qty > 0 else "draft",
+        "published": True if stock_qty > 0 else False,
         "variants": variants,
-        **({"images": imgs} if imgs else {})
+        **({"images": images} if images else {})
     }
     if len(variants) > 1:
         product["options"] = [{"name": "Size", "values": sizes}]
     return product
  
 # -----------------------------
-# LOAD XML
+# LOAD XML (fragment-safe, BeautifulSoup fallback)
 # -----------------------------
 def load_xml():
-    print("📥 Downloading feed…")
-    r = requests.get(XML_URL, timeout=60)
+    print("📥 Downloading XML...")
+    r = requests.get(XML_URL)
     r.raise_for_status()
-    raw = r.content.decode("utf-8", errors="replace")
-    # save debug
+    raw_bytes = r.content
+    raw = raw_bytes.decode('utf-8', errors='replace')
     try:
         with open("feed_debug.xml", "wb") as f:
-            f.write(r.content)
-        print("ℹ️ feed_debug.xml saved.")
-    except:
-        pass
- 
+            f.write(raw_bytes)
+        print("ℹ️ Saved raw feed to feed_debug.xml")
+    except Exception as e:
+        print("⚠️ Couldn't save raw feed:", e)
     posts = re.findall(r"(?is)<post\b[^>]*?>.*?</post>", raw)
-    max_take = LIMIT if LIMIT is not None else None
     if posts:
+        print(f"🔎 Extracted {len(posts)} <post> blocks from feed (regex fragment parsing).")
         items = []
-        for frag in posts[:max_take]:
+        for fragment in posts[:LIMIT]:
             try:
-                root = ET.fromstring(f"<root>{frag}</root>")
-                post = root.find(".//post")
-                if post is None: continue
-                data = {c.tag.lower(): c.text for c in post}
+                wrapped = f"<root>{fragment}</root>"
+                root = ET.fromstring(wrapped)
+                post_elem = root.find(".//post")
+                if post_elem is None:
+                    continue
+                data = {}
+                for c in post_elem:
+                    data[c.tag.lower()] = c.text
                 items.append(data)
             except Exception as e:
-                print("⚠️ fragment parse:", e)
+                print("⚠️ Failed to parse a <post> fragment:", e)
+        print(f"🔎 Parsed {len(items)} items from <post> fragments (limit {LIMIT}).")
         if items:
-            print(f"🔎 Parsed {len(items)} items (fragment).")
             return items
- 
-    # Full parse
     try:
         root = ET.fromstring(raw)
-        posts = root.findall(".//post")
-        items = []
-        for post in posts[:max_take] if max_take else posts:
-            data = {c.tag.lower(): c.text for c in post}
-            items.append(data)
-        if items:
-            print(f"🔎 Parsed {len(items)} items (full).")
-            return items
+        items_elem = root.findall(".//post")
+        print(f"🔎 Found {len(items_elem)} items (full parse).")
+        products = []
+        for item in items_elem[:LIMIT]:
+            data = {}
+            for c in item:
+                data[c.tag.lower()] = c.text
+            products.append(data)
+        if products:
+            return products
     except ParseError as e:
-        print("⚠️ full XML parse error:", e)
- 
-    # BeautifulSoup fallback
+        print("⚠️ XML ParseError on full parse:", e)
     try:
         from bs4 import BeautifulSoup
-        print("🔧 BS4 fallback…")
+        print("🔧 Falling back to BeautifulSoup repair parsing...")
         soup = BeautifulSoup(raw, "html.parser")
-        posts = soup.find_all(lambda t: t.name and t.name.lower()=="post")
+        posts_bs = soup.find_all(lambda tag: tag.name and tag.name.lower() == "post")
+        print(f"🔎 BeautifulSoup found {len(posts_bs)} post-like elements.")
         items = []
-        for post in posts[:max_take] if max_take else posts:
-            data = {child.name.lower(): child.get_text() for child in post.find_all(recursive=False)}
+        for post in posts_bs[:LIMIT]:
+            data = {}
+            for child in post.find_all(recursive=False):
+                tagname = child.name.lower() if child.name else None
+                data[tagname] = child.get_text() if child else None
+            if not data and post.get_text(strip=True):
+                data["content"] = post.get_text()
             items.append(data)
         if items:
             return items
-    except:
-        pass
- 
-    print("❌ Could not parse feed.")
+    except Exception as e:
+        print("⚠️ BeautifulSoup fallback failed or bs4 missing:", e)
+    print("🔎 Final fallback: heuristic splitting by '<post'...")
+    pieces = re.split(r"(?i)<post\b", raw)
+    candidates = []
+    for piece in pieces[1:LIMIT + 1]:
+        snippet = "<post" + piece
+        m = re.search(r"(?is)<post\b.*?</post>", snippet)
+        if m:
+            fragment = m.group(0)
+            try:
+                wrapped = f"<root>{fragment}</root>"
+                root = ET.fromstring(wrapped)
+                post_elem = root.find(".//post")
+                if post_elem is None:
+                    continue
+                data = {}
+                for c in post_elem:
+                    data[c.tag.lower()] = c.text
+                candidates.append(data)
+            except Exception:
+                continue
+    if candidates:
+        print(f"🔎 Heuristic parsed {len(candidates)} items.")
+        return candidates
+    print("❌ Could not parse feed into <post> items. Check feed_debug.xml for raw content.")
     return []
  
 # -----------------------------
-# INDEX STORE PRODUCTS
+# PROCESS PRODUCT
 # -----------------------------
-def build_store_index():
-    print("📚 Indexing store products…")
-    handle_map, sku_map, barcode_map = {}, {}, {}
-    page = 1
- 
-    while True:
+def process_product(p):
+    product_payload = build_product(p)
+    handle = product_payload.get("handle")
+    sku = p.get("sku")
+    barcode = p.get("barcode")
+    title = product_payload.get("title")
+    existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
+    
+    if existing:
+        sku_map, option_map = _existing_variant_map(existing)
+        updated_variants = []
+        for v in product_payload["variants"]:
+            vid = None
+            v_sku = str(v.get("sku") or "")
+            opt1 = str(v.get("option1") or "")
+            if v_sku and v_sku in sku_map:
+                vid = sku_map[v_sku]
+            elif opt1 and opt1 in option_map:
+                vid = option_map[opt1]
+            v_copy = v.copy()
+            if vid:
+                v_copy["id"] = vid
+            v_copy["price"] = str(v_copy.get("price"))
+            v_copy["inventory_quantity"] = int(v_copy.get("inventory_quantity", 0))
+            updated_variants.append(v_copy)
+        product_update_payload = product_payload.copy()
+        product_update_payload["variants"] = updated_variants
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+        shopify_put(url, {"product": product_update_payload})
+        return f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})"
+    else:
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-        res = safe_get(url, params={"limit": PAGE_LIMIT, "page": page})
-        prods = res.get("products", [])
-        if not prods:
-            break
-        for p in prods:
-            pid = p.get("id")
-            if p.get("handle"):
-                handle_map[p["handle"]] = p
-            for v in p.get("variants", []):
-                sku = str(v.get("sku") or "")
-                bc  = v.get("barcode")
-                if sku:   sku_map[sku]      = p
-                if bc:    barcode_map[bc]    = p
-        if len(prods) < PAGE_LIMIT:
-            break
-        page += 1
-        time.sleep(0.2)
- 
-    print(f"Indexed {len(handle_map)} handles, {len(sku_map)} SKUs, {len(barcode_map)} barcodes.")
-    return handle_map, sku_map, barcode_map
+        res, remaining_calls = shopify_post(url, {"product": product_payload})
+        if res.get("product", {}).get("id"):
+            return f"🆕 Created: {product_payload['title']} (ID: {res['product']['id']})"
+        else:
+            return f"❌ Failed to create: {product_payload['title']}"
  
 # -----------------------------
-# VARIANT ID MAP
+# SYNC
 # -----------------------------
-def existing_variant_map(prod):
-    sku_map, opt_map = {}, {}
-    for v in prod.get("variants", []):
-        vid  = v.get("id")
-        sku  = str(v.get("sku") or "")
-        opt1 = str(v.get("option1") or "")
-        if sku:   sku_map[sku] = vid
-        if opt1:  opt_map[opt1] = vid
-    return sku_map, opt_map
+def run_sync():
+    print("🚀 START SYNC")
+    items = load_xml()
+    created = 0
+    updated = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(process_product, p): p for p in items}
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            print(result)
+            if "Created" in result:
+                created += 1
+            elif "Updated" in result:
+                updated += 1
+            
+            # Adding delay to prevent hitting API rate limits
+            time.sleep(1)  # Adjust as necessary, e.g., 1 second between requests
  
-    # -----------------------------
-    # Main sync loop
-    # -----------------------------
-    def run_sync():
-        if not SHOP_URL or not ACCESS_TOKEN or not XML_URL:
-            print("❌ Missing SHOP_URL/ACCESS_TOKEN/XML_URL")
-            return
+    print("✅ DONE")
+    print(f"Created: {created}, Updated: {updated}")
  
-        items = load_xml()
-        if not items:
-            print("❌ No items parsed from feed.")
-            return
- 
-        handle_map, sku_map, barcode_map = build_store_index()
-        created, updated = 0, 0
- 
-        for p in items:
-            payload = build_product_payload(p)
-            handle  = payload["handle"]
-            sku     = (p.get("sku") or "").strip()
-            bc      = p.get("barcode") or None
- 
-            # find existing by SKU, barcode, handle, then title-search fallback
-            existing = sku_map.get(sku) or barcode_map.get(bc) or handle_map.get(handle)
-            if not existing:
-                # title search
-                res_search = safe_get(
-                    f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json",
-                    params={"title": payload["title"]}
-                )
-                for cand in res_search.get("products", []) or []:
-                    for v in cand.get("variants", []) or []:
-                        if (sku and str(v.get("sku")) == sku) or (bc and v.get("barcode") == bc):
-                            existing = cand
-                            break
-                    if existing:
-                        break
- 
-            if existing:
-                # UPDATE path
-                vid_map, opt_map = existing_variant_map(existing)
-                upd_vars = []
-                for v in payload["variants"]:
-                    key_sku = v.get("sku", "")
-                    key_opt = v.get("option1", "")
-                    vid = vid_map.get(key_sku) or opt_map.get(key_opt)
-                    var = {
-                        **({"id": vid} if vid else {}),
-                        "price":              v["price"],
-                        "sku":                v.get("sku", ""),
-                        "inventory_quantity": int(v.get("inventory_quantity", 0)),
-                        "inventory_management": v.get("inventory_management"),
-                        "barcode":            v.get("barcode"),
-                        "weight":             v.get("weight"),
-                        "weight_unit":        v.get("weight_unit"),
-                    }
-                    # drop None-valued keys
-                    var = {k: vv for k, vv in var.items() if vv is not None}
-                    upd_vars.append(var)
- 
-                body = {
-                    "title":        payload["title"],
-                    "body_html":    payload["body_html"],
-                    "vendor":       payload["vendor"],
-                    "product_type": payload["product_type"],
-                    "tags":         payload["tags"],
-                    "variants":     upd_vars,
-                }
-                if payload.get("images"):
-                    body["images"] = payload["images"]
- 
-                res = safe_put(
-                    f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json",
-                    {"product": body}
-                )
-                if res.get("product"):
-                    updated += 1
-                    print(f"🔄 Updated {payload['title']} (ID {existing['id']})")
-                    # refresh maps
-                    prod = res["product"]
-                    handle_map[prod["handle"]] = prod
-                    for v in prod.get("variants", []) or []:
-                        sku_map[str(v.get("sku") or "")] = prod
-                        bc2 = v.get("barcode")
-                        if bc2:
-                            barcode_map[bc2] = prod
-                else:
-                    print(f"❌ Update failed: {payload['title']}")
-            else:
-                # CREATE path
-                res = safe_post(
-                    f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json",
-                    {"product": payload}
-                )
-                prod = res.get("product") or {}
-                pid = prod.get("id")
-                if pid:
-                    created += 1
-                    print(f"🆕 Created {payload['title']} (ID {pid})")
-                    handle_map[prod["handle"]] = prod
-                    for v in prod.get("variants", []) or []:
-                        sku_map[str(v.get("sku") or "")] = prod
-                        bc2 = v.get("barcode")
-                        if bc2:
-                            barcode_map[bc2] = prod
-                else:
-                    print(f"❌ Create failed: {payload['title']}")
- 
-            # throttle to avoid rate limits
-            time.sleep(0.5)
- 
-        print("✅ DONE")
-        print(f"Created: {created}, Updated: {updated}")
+# -----------------------------
+# RUN
+# -----------------------------
+if __name__ == "__main__":
+    run_sync()
