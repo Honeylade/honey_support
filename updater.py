@@ -273,13 +273,13 @@ def load_xml() -> list:
         logger.error(f"⚠️ Couldn't save raw feed: {e}")
  
     # Attempt to parse XML safely
+    products = []  # Ensure products is initialized
     try:
         root = ET.fromstring(raw)
         items_elem = root.findall(".//post")
         logger.info(f"🔎 Found {len(items_elem)} items (full parse).")
-        products = []
         for item in items_elem[:LIMIT] if LIMIT else items_elem:
-            data = {c.tag.lower(): c.text for c in item}
+            data = {c.tag.lower(): c.text for c in item}  # Define data here
             products.append(data)
         if products:
             return products
@@ -301,6 +301,7 @@ def load_xml_fragments(raw: str) -> list:
             if post_elem is None:
                 logger.error("⚠️ No <post> element found in fragment.")
                 continue
+            # Define data here within the try block
             data = {c.tag.lower(): c.text for c in post_elem}
             items.append(data)
         except ET.ParseError as e:
