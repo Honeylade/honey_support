@@ -264,31 +264,7 @@ def load_xml():
     except Exception as e:
         print("⚠️ Couldn't save raw feed:", e)
  
-    posts = re.findall(r"(?is)<post\b[^>]*?>.*?</post>", raw)
-    items = []
- 
-    if posts:
-        print(f"🔎 Extracted {len(posts)} <post> blocks from feed (regex fragment parsing).")
-        for fragment in posts[:LIMIT] if LIMIT else posts:
-            try:
-                wrapped = f"<root>{fragment}</root>"
-                root = ET.fromstring(wrapped)
-                post_elem = root.find(".//post")
-                if post_elem is None:
-                    print("⚠️ No <post> element found in fragment.")
-                    continue
-                data = {c.tag.lower(): c.text for c in post_elem}
-                items.append(data)
-            except ET.ParseError as e:
-                print(f"⚠️ Failed to parse a <post> fragment: {e}. Fragment: {fragment[:100]}...")  # Show part of the fragment for context
-            except Exception as e:
-                print(f"⚠️ Unexpected error: {e}")
- 
-        print(f"🔎 Parsed {len(items)} items from <post> fragments (limit {LIMIT if LIMIT else 'all'}).")
-        if items:
-            return items
- 
-    # Full XML parsing as a fallback
+    # Attempt to parse XML safely
     try:
         root = ET.fromstring(raw)
         items_elem = root.findall(".//post")
@@ -301,11 +277,31 @@ def load_xml():
             return products
     except ET.ParseError as e:
         print(f"⚠️ XML ParseError on full parse: {e}. Check the XML structure.")
-    except Exception as e:
-        print(f"⚠️ Unexpected error during full parse: {e}")
+        # Attempt to recover by processing fragments
+        return load_xml_fragments(raw)
  
     print("❌ Could not parse feed into <post> items. Check feed_debug.xml for raw content.")
     return []
+ 
+def load_xml_fragments(raw):
+    posts = re.findall(r"(?is)<post\b[^>]*?>.*?</post>", raw)
+    items = []
+    for fragment in posts[:LIMIT] if LIMIT else posts:
+        try:
+            wrapped = f"<root>{fragment}</root>"
+            root = ET.fromstring(wrapped)
+            post_elem = root.find(".//post")
+            if post_elem is None:
+                print("⚠️ No <post> element found in fragment.")
+                continue
+            data = {c.tag.lower(): c.text for c in post_elem}
+            items.append(data)
+        except ET.ParseError as e:
+            print(f"⚠️ Failed to parse a <post> fragment: {e}. Fragment: {fragment[:100]}...")  # Show part of the fragment for context
+        except Exception as e:
+            print(f"⚠️ Unexpected error: {e}")
+    print(f"🔎 Parsed {len(items)} items from <post> fragments (limit {LIMIT if LIMIT else 'all'}).")
+    return items
  
 # -----------------------------
 # PROCESS PRODUCT
