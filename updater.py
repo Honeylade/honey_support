@@ -210,6 +210,8 @@ def build_product(p: dict) -> dict:
     variants = []
     sizes_raw = (p.get("sizeattribute") or "")
     sizes = [s.strip() for s in re.split(r"[|,]+", sizes_raw) if s.strip()]
+    
+    # Convert stock_qty using safe_int
     stock_qty = safe_int(p.get("stock"))  # Use safe_int here
     barcode = p.get("barcode") if p.get("barcode") else None
  
