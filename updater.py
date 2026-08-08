@@ -228,13 +228,17 @@ def process_product(p):
             existing_variants = existing.get("variants", [])
             new_variants = product_payload.get("variants", [])
  
-            # Compare all relevant fields for existing and new products
-            if len(existing_variants) == len(new_variants) and all(
-                existing_v['sku'] == new_v['sku'] and existing_v['price'] == new_v['price'] and existing_v['inventory_quantity'] == new_v['inventory_quantity']
-                for existing_v, new_v in zip(existing_variants, new_variants)
-            ):
-                print(f"✅ Product already exists and is up-to-date: {title} (ID: {existing['id']})")
-                return "exists"
+            # Check if existing variants and new variants are available
+            if existing_variants and new_variants:
+                # Compare all relevant fields for existing and new products
+                if len(existing_variants) == len(new_variants) and all(
+                    existing_v['sku'] == new_v['sku'] and existing_v['price'] == new_v['price'] and existing_v['inventory_quantity'] == new_v['inventory_quantity']
+                    for existing_v, new_v in zip(existing_variants, new_variants)
+                ):
+                    print(f"✅ Product already exists and is up-to-date: {title} (ID: {existing['id']})")
+                    return "exists"
+            else:
+                print(f"⚠️ Variants data missing for product: {title} (ID: {existing['id']})")
  
             # Update existing product if variants differ
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
