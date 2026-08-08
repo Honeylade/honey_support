@@ -5,11 +5,11 @@ import requests
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import ParseError
 import time
-import concurrent.futures
+import threading
 from urllib.parse import unquote
  
 # -----------------------------
-# CONFIG (must be defined before functions)
+# CONFIG
 # -----------------------------
 SHOP_URL = os.getenv("SHOP_URL")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -28,6 +28,9 @@ HEADERS = {
 }
  
 TAGS_TO_INCLUDE = ["football accessories", "themed gifts", "Honeylade", "Honey", "sports gifts", "fan accessories", "novelty gifts", "sports fans"]
+ 
+# Lock for thread safety
+lock = threading.Lock()
  
 # -----------------------------
 # PRICE LOGIC
@@ -159,7 +162,7 @@ def build_product(p):
  
     images = [{"src": img.strip()} for img in re.split(r"[|,]+", p.get("imageoffloads", "")) if valid_image(img)]
     
-    stock_qty = int(p.get("stock", 0))
+    stock_qty = int(float(p.get("stock", 0)))  # Convert to int safely
     barcode = p.get("barcode")
  
     variants = [{"price": str(price), "sku": p.get("sku"), "inventory_quantity": stock_qty, "inventory_management": "shopify", "cost": float(p.get("costprice", 0)), "barcode": barcode, "weight": float(p.get("weight", 0)), "weight_unit": "g"}]
@@ -179,7 +182,7 @@ def build_product(p):
     return product
  
 # -----------------------------
-# LOAD XML (fragment-safe, BeautifulSoup fallback)
+# LOAD XML
 # -----------------------------
 def load_xml():
     print("📥 Downloading XML...")
@@ -196,13 +199,6 @@ def load_xml():
  
     raw = r.content.decode('utf-8', errors='replace')
  
-    try:
-        with open("feed_debug.xml", "wb") as f:
-            f.write(r.content)
-        print("ℹ️ Saved raw feed to feed_debug.xml")
-    except Exception as e:
-        print("⚠️ Couldn't save raw feed:", e)
- 
     items = []
     try:
         root = ET.fromstring(raw)
@@ -218,46 +214,47 @@ def load_xml():
 # PROCESS PRODUCT
 # -----------------------------
 def process_product(p):
-    product_payload = build_product(p)
-    handle = product_payload.get("handle")
-    sku = p.get("sku")
-    barcode = p.get("barcode")
-    title = product_payload.get("title")
+    with lock:  # Ensure thread safety
+        product_payload = build_product(p)
+        handle = product_payload.get("handle")
+        sku = p.get("sku")
+        barcode = p.get("barcode")
+        title = product_payload.get("title")
  
-    existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
+        existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
  
-    if existing:
-        existing_variants = existing.get("variants", [])
-        new_variants = product_payload.get("variants", [])
+        if existing:
+            existing_variants = existing.get("variants", [])
+            new_variants = product_payload.get("variants", [])
  
-        # Compare all relevant fields for existing and new products
-        if len(existing_variants) == len(new_variants) and all(
-            existing_v['sku'] == new_v['sku'] and existing_v['price'] == new_v['price'] and existing_v['inventory_quantity'] == new_v['inventory_quantity']
-            for existing_v, new_v in zip(existing_variants, new_variants)
-        ):
-            print(f"✅ Product already exists and is up-to-date: {title} (ID: {existing['id']})")
-            return "exists"
+            # Compare all relevant fields for existing and new products
+            if len(existing_variants) == len(new_variants) and all(
+                existing_v['sku'] == new_v['sku'] and existing_v['price'] == new_v['price'] and existing_v['inventory_quantity'] == new_v['inventory_quantity']
+                for existing_v, new_v in zip(existing_variants, new_variants)
+            ):
+                print(f"✅ Product already exists and is up-to-date: {title} (ID: {existing['id']})")
+                return "exists"
  
-        # Update existing product if variants differ
-        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-        response = api_request('PUT', url, {"product": product_payload})
-        if response:
-            print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
-            return "updated"
+            # Update existing product if variants differ
+            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+            response = api_request('PUT', url, {"product": product_payload})
+            if response:
+                print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+                return "updated"
+            else:
+                print(f"❌ Failed to update: {product_payload['title']}")
+                return "failed"
         else:
-            print(f"❌ Failed to update: {product_payload['title']}")
-            return "failed"
-    else:
-        # Create new product if not found
-        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-        response = api_request('POST', url, {"product": product_payload})
-        product_id = response.get("product", {}).get("id")
-        if product_id:
-            print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
-            return "created"
-        else:
-            print(f"❌ Failed to create: {product_payload['title']}")
-            return "failed"
+            # Create new product if not found
+            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+            response = api_request('POST', url, {"product": product_payload})
+            product_id = response.get("product", {}).get("id")
+            if product_id:
+                print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
+                return "created"
+            else:
+                print(f"❌ Failed to create: {product_payload['title']}")
+                return "failed"
  
 # -----------------------------
 # SYNC
@@ -269,9 +266,9 @@ def run_sync():
  
     created = 0
     updated = 0
-    
-    # Process products in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+ 
+    # Process products with a maximum of 2 workers to prevent race conditions
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = {executor.submit(process_product, p): p for p in items}
         for future in concurrent.futures.as_completed(futures):
             try:
