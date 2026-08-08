@@ -8,6 +8,7 @@ import time
 import concurrent.futures
 from urllib.parse import unquote
 from bs4 import BeautifulSoup
+import logging
  
 # -----------------------------
 # CONFIG (must be defined before functions)
@@ -30,13 +31,23 @@ HEADERS = {
  
 TAGS_TO_INCLUDE = ["football accessories", "themed gifts", "Honeylade", "Honey", "sports gifts", "fan accessories", "novelty gifts", "sports fans"]
  
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+ 
 # -----------------------------
 # PRICE LOGIC
 # -----------------------------
-def calc_price(cost, weight):
-    cost = float(cost or 0)
-    weight = float(weight or 0)
-    shipping = 3.99 if weight < 300 else 4.99 if weight < 2000 else 18
+def safe_float(value: str) -> float:
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return 0.0
+ 
+def calc_price(cost: float, weight: float) -> float:
+    cost = safe_float(cost)
+    weight = safe_float(weight)
+    shipping = 3.99 if weight < 300 else 4.99 if weight < 2000 else 18.00
     margin = 0.30 if cost < 5 else 0.25 if cost < 10 else 0.20
     TAX = 0.20
     FEES = 0.029 + 0.090
@@ -50,24 +61,23 @@ def calc_price(cost, weight):
 # -----------------------------
 # HELPERS
 # -----------------------------
-def last_value(val):
+def last_value(val: str) -> str:
     if not val:
         return ""
     v = val.split(">")[-1].strip()
     return unquote(v.replace("&amp;", "and"))
  
-def split_tags(val):
+def split_tags(val: str) -> list:
     if not val:
         return []
     return [t.strip() for t in re.split(r"[>\|,;/\s]+", val) if t.strip()]
  
-def sanitize_tags(tags):
+def sanitize_tags(tags: list) -> list:
     sanitized = []
     seen = set()
     for tag in tags:
         if not tag:
             continue
-        # Use BeautifulSoup to handle HTML entities and sanitize tags
         tag = BeautifulSoup(tag, "html.parser").text.strip()
         tag = tag[:255] if len(tag) > 255 else tag
         if tag.lower() not in seen:
@@ -75,17 +85,17 @@ def sanitize_tags(tags):
             sanitized.append(tag)
     return sanitized
  
-def build_description(p):
+def build_description(p: dict) -> str:
     bullets = []
     for i in range(1, 11):
         v = p.get(f"desc_{i}")
         if v:
             bullets.append(f"<li>{unquote(v)}</li>")
     bullet_html = f"<ul>{''.join(bullets)}</ul>" if bullets else ""
-    paragraph = f"<p>{unquote(p.get('desc_standard','') or '')}</p>"
+    paragraph = f"<p>{unquote(p.get('desc_standard', '') or '')}</p>"
     return bullet_html + paragraph
  
-def valid_image(url):
+def valid_image(url: str) -> bool:
     if not url:
         return False
     url = url.strip()
@@ -93,70 +103,59 @@ def valid_image(url):
         return False
     if " " in url:
         return False
-    if not any(url.lower().endswith(ext) or ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-        return False
-    return True
+    return any(url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"])
  
 # -----------------------------
 # SHOPIFY WRAPPERS
 # -----------------------------
-def shopify_get(url, params=None):
-    r = requests.get(url, headers=HEADERS, params=params)
-    try:
-        return r.json() if r.status_code == 200 else {}
-    except ValueError:
-        print(f"⚠️ Error parsing response for GET request to {url}: {r.text}")
+def handle_api_response(response: requests.Response) -> dict:
+    if response.status_code in [200, 201]:
+        return response.json()
+    elif response.status_code == 429:
+        wait_time = int(response.headers.get('Retry-After', 1))
+        logger.warning(f"Rate limit exceeded. Retrying in {wait_time}s...")
+        time.sleep(wait_time)
+        return handle_api_response(response)  # Retry
+    else:
+        logger.error(f"Error: {response.status_code} - {response.text}")
         return {}
  
-def api_request(method, url, data=None):
+def api_request(method: str, url: str, dict = None) -> dict:
     max_retries = 5
-    retries = 0
+    base_wait_time = 1  # Start with 1 second
  
-    while retries < max_retries:
+    for attempt in range(max_retries):
         try:
-            if method == 'PUT':
-                response = requests.put(url, headers=HEADERS, json=data)
-            elif method == 'POST':
-                response = requests.post(url, headers=HEADERS, json=data)
- 
-            if response.status_code in [200, 201]:
-                return response.json()
-            elif response.status_code == 429:
-                print("❌ Rate limit exceeded. Retrying...")
-                wait_time = int(response.headers.get('Retry-After', 1))
-                time.sleep(wait_time)  # Wait based on Retry-After header
-                retries += 1
-                continue
-            else:
-                print(f"❌ Error: {response.status_code} - {response.text}")
-                break
- 
+            response = requests.request(method, url, headers=HEADERS, json=data)
+            return handle_api_response(response)
         except requests.exceptions.RequestException as e:
-            print(f"⚠️ Request failed: {e}")
-            break
- 
-    print("❌ Max retries reached. Aborting request.")
+            logger.error(f"Request failed: {e}")
+            if attempt < max_retries - 1:
+                wait_time = base_wait_time * (2 ** attempt)  # Exponential backoff
+                time.sleep(wait_time)
+    logger.error("Max retries reached. Aborting request.")
     return None
  
 # -----------------------------
 # FIND PRODUCT
 # -----------------------------
-def find_product_by_handle(handle):
+def find_product_by_handle(handle: str) -> dict:
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
     res = shopify_get(url, {"handle": handle})
     products = res.get("products") or []
     return products[0] if products else None
  
-def find_product_by_sku_or_barcode(sku=None, barcode=None, title=None):
+def find_product_by_sku_or_barcode(sku: str = None, barcode: str = None, title: str = None) -> dict:
+    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+    params = {"limit": 250}
+ 
     if title:
-        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
         res = shopify_get(url, {"title": title})
         for p in res.get("products", []):
             for v in p.get("variants", []):
                 if (sku and str(v.get("sku")) == str(sku)) or (barcode and v.get("barcode") and v.get("barcode") == barcode):
                     return p
-    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-    params = {"limit": 250}
+ 
     page = shopify_get(url, params=params) or {}
     for p in page.get("products", []):
         for v in p.get("variants", []):
@@ -164,7 +163,11 @@ def find_product_by_sku_or_barcode(sku=None, barcode=None, title=None):
                 return p
     return None
  
-def _existing_variant_map(existing_product):
+def shopify_get(url: str, params: dict = None) -> dict:
+    r = requests.get(url, headers=HEADERS, params=params)
+    return handle_api_response(r)
+ 
+def _existing_variant_map(existing_product: dict) -> dict:
     sku_map = {}
     option_map = {}
     for v in existing_product.get("variants", []):
@@ -180,11 +183,11 @@ def _existing_variant_map(existing_product):
 # -----------------------------
 # BUILD PRODUCT PAYLOAD
 # -----------------------------
-def build_product(p):
+def build_product(p: dict) -> dict:
     title = p.get("title") or f"Product-{p.get('sku')}"
     handle = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
-    cost = float(p.get("costprice") or 0)
-    weight = float(p.get("weight") or 0)
+    cost = safe_float(p.get("costprice"))
+    weight = safe_float(p.get("weight"))
     price = calc_price(cost, weight)
     vendor = last_value(p.get("productbrand"))
     product_type = last_value(p.get("productrange"))
@@ -249,8 +252,8 @@ def build_product(p):
 # -----------------------------
 # LOAD XML (fragment-safe, BeautifulSoup fallback)
 # -----------------------------
-def load_xml():
-    print("📥 Downloading XML...")
+def load_xml() -> list:
+    logger.info("📥 Downloading XML...")
     r = requests.get(XML_URL)
     r.raise_for_status()
     raw_bytes = r.content
@@ -260,15 +263,15 @@ def load_xml():
     try:
         with open("feed_debug.xml", "wb") as f:
             f.write(raw_bytes)
-        print("ℹ️ Saved raw feed to feed_debug.xml")
+        logger.info("ℹ️ Saved raw feed to feed_debug.xml")
     except Exception as e:
-        print("⚠️ Couldn't save raw feed:", e)
+        logger.error(f"⚠️ Couldn't save raw feed: {e}")
  
     # Attempt to parse XML safely
     try:
         root = ET.fromstring(raw)
         items_elem = root.findall(".//post")
-        print(f"🔎 Found {len(items_elem)} items (full parse).")
+        logger.info(f"🔎 Found {len(items_elem)} items (full parse).")
         products = []
         for item in items_elem[:LIMIT] if LIMIT else items_elem:
             data = {c.tag.lower(): c.text for c in item}
@@ -276,13 +279,13 @@ def load_xml():
         if products:
             return products
     except ET.ParseError as e:
-        print(f"⚠️ XML ParseError on full parse: {e}. Check the XML structure.")
-        print(f"Problematic XML snippet: {raw.splitlines()[90:100]}")  # Print a snippet around the error line
+        logger.error(f"⚠️ XML ParseError on full parse: {e}. Check the XML structure.")
+        logger.error(f"Problematic XML snippet: {raw.splitlines()[90:100]}")
  
-    print("❌ Could not parse feed into <post> items. Check feed_debug.xml for raw content.")
+    logger.error("❌ Could not parse feed into <post> items. Check feed_debug.xml for raw content.")
     return []
  
-def load_xml_fragments(raw):
+def load_xml_fragments(raw: str) -> list:
     posts = re.findall(r"(?is)<post\b[^>]*?>.*?</post>", raw)
     items = []
     for fragment in posts[:LIMIT] if LIMIT else posts:
@@ -291,60 +294,55 @@ def load_xml_fragments(raw):
             root = ET.fromstring(wrapped)
             post_elem = root.find(".//post")
             if post_elem is None:
-                print("⚠️ No <post> element found in fragment.")
+                logger.error("⚠️ No <post> element found in fragment.")
                 continue
             data = {c.tag.lower(): c.text for c in post_elem}
             items.append(data)
         except ET.ParseError as e:
-            print(f"⚠️ Failed to parse a <post> fragment: {e}. Fragment: {fragment[:100]}...")  # Show part of the fragment for context
+            logger.error(f"⚠️ Failed to parse a <post> fragment: {e}. Fragment: {fragment[:100]}...")
         except Exception as e:
-            print(f"⚠️ Unexpected error: {e}")
-    print(f"🔎 Parsed {len(items)} items from <post> fragments (limit {LIMIT if LIMIT else 'all'}).")
+            logger.error(f"⚠️ Unexpected error: {e}")
+    logger.info(f"🔎 Parsed {len(items)} items from <post> fragments (limit {LIMIT if LIMIT else 'all'}).")
     return items
  
 # -----------------------------
 # PROCESS PRODUCT
 # -----------------------------
-def process_product(p):
+def process_product(p: dict) -> str:
     product_payload = build_product(p)
     handle = product_payload.get("handle")
     sku = p.get("sku")
     barcode = p.get("barcode")
     title = product_payload.get("title")
  
-    # Log tags for debugging
-    print(f"Tags being sent for {title}: {product_payload.get('tags')}")
+    logger.info(f"Processing product: {title}")
  
-    # Check for existing product using handle or SKU/barcode
-    existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
+    existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
  
     if existing:
         # Update existing product
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
         response = api_request('PUT', url, {"product": product_payload})
         if response:
-            print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+            logger.info(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
             return "updated"
-        else:
-            print(f"❌ Failed to update: {product_payload['title']}")
-            return "failed"
     else:
-        # Create new product
+        # Create new product only if it does not exist
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
         response = api_request('POST', url, {"product": product_payload})
         product_id = response.get("product", {}).get("id")
         if product_id:
-            print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
+            logger.info(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
             return "created"
-        else:
-            print(f"❌ Failed to create: {product_payload['title']}")
-            return "failed"
+ 
+    logger.error(f"❌ Failed to process: {product_payload['title']}")
+    return "failed"
  
 # -----------------------------
 # SYNC
 # -----------------------------
 def run_sync():
-    print("🚀 START SYNC")
+    logger.info("🚀 START SYNC")
  
     items = load_xml()
  
@@ -352,7 +350,7 @@ def run_sync():
     updated = 0
     
     # Process products in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:  # Adjust to handle rate limits
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(process_product, p): p for p in items}
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -362,10 +360,10 @@ def run_sync():
                 elif result == "updated":
                     updated += 1
             except Exception as e:
-                print(f"⚠️ Error processing product: {e}")
+                logger.error(f"⚠️ Error processing product: {e}")
  
-    print("✅ DONE")
-    print(f"Created: {created}, Updated: {updated}")
+    logger.info("✅ DONE")
+    logger.info(f"Created: {created}, Updated: {updated}")
  
 # -----------------------------
 # RUN
