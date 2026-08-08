@@ -7,6 +7,7 @@ from xml.etree.ElementTree import ParseError
 import time
 import threading
 from urllib.parse import unquote
+import concurrent.futures  # Import concurrent futures
  
 # -----------------------------
 # CONFIG
