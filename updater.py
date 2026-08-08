@@ -303,6 +303,7 @@ def load_xml_fragments(raw: str) -> list:
             if post_elem is None:
                 logger.error("⚠️ No <post> element found in fragment.")
                 continue
+            
             # Define data here within the try block
             data = {c.tag.lower(): c.text for c in post_elem}
             items.append(data)
