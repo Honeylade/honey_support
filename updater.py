@@ -3,7 +3,6 @@ import os
 import re
 import requests
 import xml.etree.ElementTree as ET
-from xml.etree.ElementTree import ParseError
 import time
 import concurrent.futures
 from urllib.parse import unquote
@@ -43,6 +42,12 @@ def safe_float(value: str) -> float:
         return float(value)
     except (ValueError, TypeError):
         return 0.0
+ 
+def safe_int(value: str) -> int:
+    try:
+        return int(float(value))  # Convert to float first, then to int
+    except (ValueError, TypeError):
+        return 0  # Default to 0 if conversion fails
  
 def calc_price(cost: float, weight: float) -> float:
     cost = safe_float(cost)
@@ -205,7 +210,7 @@ def build_product(p: dict) -> dict:
     variants = []
     sizes_raw = (p.get("sizeattribute") or "")
     sizes = [s.strip() for s in re.split(r"[|,]+", sizes_raw) if s.strip()]
-    stock_qty = int(p.get("stock") or 0)
+    stock_qty = safe_int(p.get("stock"))  # Use safe_int here
     barcode = p.get("barcode") if p.get("barcode") else None
  
     if sizes:
@@ -214,7 +219,7 @@ def build_product(p: dict) -> dict:
                 "option1": s,
                 "price": str(price),
                 "sku": p.get("sku"),
-                "inventory_quantity": int(stock_qty),
+                "inventory_quantity": stock_qty,
                 "inventory_management": "shopify",
                 "cost": cost,
                 "barcode": barcode,
@@ -225,7 +230,7 @@ def build_product(p: dict) -> dict:
         variants.append({
             "price": str(price),
             "sku": p.get("sku"),
-            "inventory_quantity": int(stock_qty),
+            "inventory_quantity": stock_qty,
             "inventory_management": "shopify",
             "cost": cost,
             "barcode": barcode,
