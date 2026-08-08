@@ -277,8 +277,7 @@ def load_xml():
             return products
     except ET.ParseError as e:
         print(f"⚠️ XML ParseError on full parse: {e}. Check the XML structure.")
-        # Attempt to recover by processing fragments
-        return load_xml_fragments(raw)
+        print(f"Problematic XML snippet: {raw.splitlines()[90:100]}")  # Print a snippet around the error line
  
     print("❌ Could not parse feed into <post> items. Check feed_debug.xml for raw content.")
     return []
