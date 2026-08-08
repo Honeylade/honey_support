@@ -251,7 +251,18 @@ def build_product(p):
 def load_xml():
     print("📥 Downloading XML...")
     r = requests.get(XML_URL)
-    r.raise_for_status()
+    
+    # Check for successful response
+    if r.status_code != 200:
+        print(f"⚠️ Error fetching XML: {r.status_code} - {r.text}")
+        return []
+ 
+    # Check if the content type is XML
+    if 'xml' not in r.headers.get('Content-Type', '').lower():
+        print("⚠️ Expected XML but received a different content type. Content received:")
+        print(r.text)  # Log the text for further inspection
+        return []
+ 
     raw_bytes = r.content
     raw = raw_bytes.decode('utf-8', errors='replace')
  
