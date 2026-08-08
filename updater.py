@@ -67,8 +67,9 @@ def sanitize_tags(tags):
         if not tag:
             continue
         t = unquote(tag.replace('&amp;', 'and')).strip()  # Handle '&amp;' properly
-        t = t[:255] if len(t) > 255 else t
-        if t.lower() not in seen:
+        t = t[:255] if len(t) > 255 else t  # Limit length to 255 characters
+        # Only allow alphanumeric characters, spaces, hyphens, and underscores
+        if t.lower() not in seen and all(c.isalnum() or c in [' ', '-', '_'] for c in t):  
             seen.add(t.lower())
             sanitized.append(t)
     return sanitized
@@ -233,7 +234,7 @@ def build_product(p):
         "body_html": description,
         "vendor": vendor,
         "product_type": product_type,
-        "tags": ", ".join(tags),
+        "tags": ", ".join(tags),  # Join tags for Shopify API
         "handle": handle,
         "status": "active" if stock_qty > 0 else "draft",
         "published": True if stock_qty > 0 else False,
@@ -316,7 +317,8 @@ def process_product(p):
     title = product_payload.get("title")
  
     # Log tags for debugging
-    print(f"Tags being sent for {title}: {product_payload.get('tags')}")
+    tags = product_payload.get('tags')
+    print(f"Tags being sent for {title}: {tags}")
  
     # Check for existing product using handle or SKU/barcode
     existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
