@@ -241,6 +241,8 @@ def process_product(p):
  
         existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
  
+        logging.info(f"Constructed product payload: {product_payload}")
+ 
         if existing:
             existing_variants = existing.get("variants", [])
             new_variants = product_payload.get("variants", [])
@@ -254,30 +256,31 @@ def process_product(p):
                 return "failed"
  
             # Compare all relevant fields for existing and new products
-            if len(existing_variants) == len(new_variants) and all(
-                existing_v['sku'] == new_v['sku'] and existing_v['price'] == new_v['price'] and existing_v['inventory_quantity'] == new_v['inventory_quantity']
-                for existing_v, new_v in zip(existing_variants, new_variants)
-            ):
-                logging.info(f"Product already exists and is up-to-date: {title} (ID: {existing['id']})")
-                return "exists"
+            for existing_v, new_v in zip(existing_variants, new_variants):
+                if (
+                    existing_v['sku'] != new_v['sku'] or
+                    round(float(existing_v['price']), 2) != round(float(new_v['price']), 2) or
+                    existing_v['inventory_quantity'] != new_v['inventory_quantity']
+                ):
+                    logging.info(f"Updating product: {title} (ID: {existing['id']}) - Differences found.")
+                    # Update the product
+                    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+                    response = api_request('PUT', url, {"product": product_payload})
+                    if response:
+                        logging.info(f"Updated: {product_payload['title']} (ID: {existing['id']})")
+                        return "updated"
+                    else:
+                        logging.error(f"Failed to update: {product_payload['title']}")
+                        return "failed"
  
-            # Update existing product if variants differ
-            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-            response = api_request('PUT', url, {"product": product_payload})
-            if response:
-                logging.info(f"Updated: {product_payload['title']} (ID: {existing['id']})")
-                return "updated"
-            else:
-                logging.error(f"Failed to update: {product_payload['title']}")
-                return "failed"
+            logging.info(f"Product already exists and is up-to-date: {title} (ID: {existing['id']})")
+            return "exists"
         else:
             # Create new product if not found
-            # Check if product payload has variants
             if not product_payload.get("variants"):
                 logging.error(f"No variants found for new product: {title}. Skipping creation.")
                 return "failed"
  
-            # Log the payload before attempting to create
             logging.info(f"Creating new product with payload: {product_payload}")
  
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
