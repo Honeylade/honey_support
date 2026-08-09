@@ -231,6 +231,9 @@ def load_xml():
 # -----------------------------
 def process_product(p):
     with lock:  # Ensure thread safety
+        # Log the product being processed
+        logging.info(f"Processing product: {p.get('title')} with SKU: {p.get('sku')}")
+ 
         product_payload = build_product(p)
         handle = product_payload.get("handle")
         sku = p.get("sku")
@@ -242,6 +245,10 @@ def process_product(p):
         if existing:
             existing_variants = existing.get("variants", [])
             new_variants = product_payload.get("variants", [])
+ 
+            if not existing_variants or not new_variants:
+                logging.error(f"No variants found for existing or new product: {title}. Skipping update.")
+                return "failed"
  
             # Compare all relevant fields for existing and new products
             if len(existing_variants) == len(new_variants) and all(
@@ -262,6 +269,10 @@ def process_product(p):
                 return "failed"
         else:
             # Create new product if not found
+            if not product_payload.get("variants"):
+                logging.error(f"No variants found for new product: {title}. Skipping creation.")
+                return "failed"
+ 
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
             response = api_request('POST', url, {"product": product_payload})
             product_id = response.get("product", {}).get("id")
