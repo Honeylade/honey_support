@@ -28,7 +28,7 @@ HEADERS = {
     "Accept": "application/json"
 }
  
-TAGS_TO_INCLUDE = ["football accessories", "themed gifts", "Honeylade", "Honey", "sports gifts", "fan accessories", "novelty gifts", "sports fans"]
+TAGS_TO_INCLUDE = ["football accessories", "football", "rugby", "entertainment", "themed gifts", "Honeylade", "flags", "sports gifts", "fan accessories", "novelty gifts", "sports fans"]
  
 # Lock for thread safety
 lock = threading.Lock()
