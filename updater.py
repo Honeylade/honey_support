@@ -247,15 +247,12 @@ def process_product(p):
             existing_variants = existing.get("variants", [])
             new_variants = product_payload.get("variants", [])
  
-            # Check if existing and new variants are present
-            if not existing_variants:
-                logging.error(f"No existing variants found for product: {title}. Skipping update.")
-                return "failed"
-            if not new_variants:
-                logging.error(f"No new variants found for product: {title}. Skipping creation.")
+            # Defensive check: Ensure variants exist
+            if not existing_variants or not new_variants:
+                logging.error(f"Existing or new variants missing for product: {title}. Skipping update.")
                 return "failed"
  
-            # Compare all relevant fields for existing and new products
+            # Compare existing and new variants
             for existing_v, new_v in zip(existing_variants, new_variants):
                 if (
                     existing_v['sku'] != new_v['sku'] or
