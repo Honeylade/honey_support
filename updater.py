@@ -7,7 +7,7 @@ from xml.etree.ElementTree import ParseError
 import time
 import threading
 from urllib.parse import unquote
-import concurrent.futures  # Import concurrent futures
+import concurrent.futures
 import logging
  
 # Configure logging
@@ -32,7 +32,8 @@ HEADERS = {
     "Accept": "application/json"
 }
  
-TAGS_TO_INCLUDE = ["football accessories", "football", "rugby", "entertainment", "themed gifts", "Honeylade", "flags", "sports gifts", "fan accessories", "novelty gifts", "sports fans"]
+TAGS_TO_INCLUDE = ["football accessories", "football", "rugby", "entertainment", "themed gifts", 
+                   "Honeylade", "flags", "sports gifts", "fan accessories", "novelty gifts", "sports fans"]
  
 # Lock for thread safety
 lock = threading.Lock()
@@ -178,7 +179,16 @@ def build_product(p):
     stock_qty = int(float(p.get("stock", 0)))  # Convert to int safely
     barcode = p.get("barcode")
  
-    variants = [{"price": str(price), "sku": p.get("sku"), "inventory_quantity": stock_qty, "inventory_management": "shopify", "cost": costprice, "barcode": barcode, "weight": weight, "weight_unit": "g"}]
+    variants = [{
+        "price": str(price),
+        "sku": p.get("sku"),
+        "inventory_quantity": stock_qty,
+        "inventory_management": "shopify",
+        "cost": costprice,
+        "barcode": barcode,
+        "weight": weight,
+        "weight_unit": "g"
+    }]
  
     product = {
         "title": title,
@@ -200,7 +210,7 @@ def build_product(p):
 def load_xml():
     logging.info("Downloading XML...")
     headers = {
-        "User-Agent": "Mozilla/5.0",  # Add User-Agent header
+        "User-Agent": "Mozilla/5.0",  # Adding User-Agent header
     }
     r = requests.get(XML_URL, headers=headers)
  
