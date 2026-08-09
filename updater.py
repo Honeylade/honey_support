@@ -199,7 +199,10 @@ def build_product(p):
 # -----------------------------
 def load_xml():
     logging.info("Downloading XML...")
-    r = requests.get(XML_URL)
+    headers = {
+        "User-Agent": "Mozilla/5.0",  # Add User-Agent header
+    }
+    r = requests.get(XML_URL, headers=headers)
  
     if r.status_code != 200:
         logging.error(f"Error fetching XML: {r.status_code} - {r.text}")
