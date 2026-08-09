@@ -231,7 +231,6 @@ def load_xml():
 # -----------------------------
 def process_product(p):
     with lock:  # Ensure thread safety
-        # Log the product being processed
         logging.info(f"Processing product: {p.get('title')} with SKU: {p.get('sku')}")
  
         product_payload = build_product(p)
@@ -246,6 +245,7 @@ def process_product(p):
             existing_variants = existing.get("variants", [])
             new_variants = product_payload.get("variants", [])
  
+            # Check if existing variants and new variants are present
             if not existing_variants or not new_variants:
                 logging.error(f"No variants found for existing or new product: {title}. Skipping update.")
                 return "failed"
