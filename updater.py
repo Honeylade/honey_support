@@ -249,7 +249,6 @@ def process_product(p):
             if not existing_variants:
                 logging.error(f"No existing variants found for product: {title}. Skipping update.")
                 return "failed"
- 
             if not new_variants:
                 logging.error(f"No new variants found for product: {title}. Skipping creation.")
                 return "failed"
@@ -273,9 +272,13 @@ def process_product(p):
                 return "failed"
         else:
             # Create new product if not found
+            # Check if product payload has variants
             if not product_payload.get("variants"):
                 logging.error(f"No variants found for new product: {title}. Skipping creation.")
                 return "failed"
+ 
+            # Log the payload before attempting to create
+            logging.info(f"Creating new product with payload: {product_payload}")
  
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
             response = api_request('POST', url, {"product": product_payload})
