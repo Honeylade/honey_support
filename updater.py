@@ -1,17 +1,8 @@
-#!/usr/bin/env python3
 import os
-import re
 import requests
 import xml.etree.ElementTree as ET
-from xml.etree.ElementTree import ParseError
-import time
-import threading
-from urllib.parse import unquote
-import concurrent.futures
-import logging
- 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
  
 # -----------------------------
 # CONFIG
@@ -20,6 +11,7 @@ SHOP_URL = os.getenv("SHOP_URL")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 XML_URL = os.getenv("XML_URL")
 API_VERSION = "2024-01"
+ 
 LIMIT = os.getenv("LIMIT")  # Allow all products = None or 0
 if LIMIT in ["None", "0", None]:
     LIMIT = None
@@ -32,11 +24,11 @@ HEADERS = {
     "Accept": "application/json"
 }
  
-TAGS_TO_INCLUDE = ["football accessories", "football", "rugby", "entertainment", "themed gifts", 
-                   "Honeylade", "flags", "sports gifts", "fan accessories", "novelty gifts", "sports fans"]
- 
-# Lock for thread safety
-lock = threading.Lock()
+TAGS_TO_INCLUDE = [
+    "football accessories", "football", "rugby", "entertainment",
+    "themed gifts", "Honeylade", "flags", "sports gifts",
+    "fan accessories", "novelty gifts", "sports fans"
+]
  
 # -----------------------------
 # PRICE LOGIC
@@ -44,15 +36,26 @@ lock = threading.Lock()
 def calc_price(cost, weight):
     cost = float(cost or 0)
     weight = float(weight or 0)
+ 
     shipping = 3.99 if weight < 300 else 4.99 if weight < 2000 else 18
-    margin = 0.30 if cost < 5 else 0.25 if cost < 10 else 0.20
+ 
+    if cost < 5:
+        margin = 0.30
+    elif cost < 10:
+        margin = 0.25
+    else:
+        margin = 0.20
+ 
     TAX = 0.20
-    FEES = 0.029 + 0.090
-    FIXED_COSTS = 0.30 + 0.50
+    FEES = 0.029 + 0.09
+    FIXED_COSTS = 0.30 + 0.5
+ 
     base_price = cost * (1 + margin)
     taxed_price = base_price * (1 + TAX)
     price_after_fees = taxed_price / (1 - FEES)
+ 
     final_price = price_after_fees + shipping + FIXED_COSTS
+ 
     return round(final_price, 2)
  
 # -----------------------------
@@ -62,7 +65,7 @@ def last_value(val):
     if not val:
         return ""
     v = val.split(">")[-1].strip()
-    return unquote(v.replace("&amp;", "and"))
+    return v.replace("&amp;", "and").replace("&", "and")
  
 def split_tags(val):
     if not val:
@@ -75,9 +78,10 @@ def sanitize_tags(tags):
     for tag in tags:
         if not tag:
             continue
-        t = unquote(tag.replace('&amp;', 'and')).strip()
-        t = t[:255] if len(t) > 255 else t
-        if t.lower() not in seen and all(c.isalnum() or c in [' ', '-', '_'] for c in t):
+        t = tag.replace('&', 'and').strip()
+        if len(t) > 255:
+            t = t[:255]
+        if t.lower() not in seen:
             seen.add(t.lower())
             sanitized.append(t)
     return sanitized
@@ -87,70 +91,78 @@ def build_description(p):
     for i in range(1, 11):
         v = p.get(f"desc_{i}")
         if v:
-            bullets.append(f"<li>{unquote(v)}</li>")
+            bullets.append(f"<li>{v}</li>")
     bullet_html = f"<ul>{''.join(bullets)}</ul>" if bullets else ""
-    paragraph = f"<p>{unquote(p.get('desc_standard','') or '')}</p>"
+    paragraph = f"<p>{p.get('desc_standard','') or ''}</p>"
     return bullet_html + paragraph
  
+# -----------------------------
+# IMAGE VALIDATION
+# -----------------------------
 def valid_image(url):
     if not url:
         return False
     url = url.strip()
-    return url.startswith(("http://", "https://")) and not any(x in url for x in [" ", " "]) and any(url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"])
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False
+    if " " in url:
+        return False
+    if not any(url.lower().endswith(ext) or ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+        return False
+    return True
  
 # -----------------------------
-# SHOPIFY WRAPPERS
+# SHOPIFY SIMPLE WRAPPERS
 # -----------------------------
 def shopify_get(url, params=None):
     r = requests.get(url, headers=HEADERS, params=params)
     try:
         return r.json() if r.status_code == 200 else {}
     except ValueError:
-        logging.warning(f"Error parsing response for GET request to {url}: {r.text}")
         return {}
  
-def api_request(method, url, data=None):
-    max_retries = 5
-    retries = 0
+def shopify_post(url, data):
+    r = requests.post(url, headers=HEADERS, json=data)
+    if r.status_code not in [200, 201]:
+        print("❌ POST ERROR:", r.status_code, r.text)
+    try:
+        return r.json()
+    except ValueError:
+        return {}
  
-    while retries < max_retries:
-        try:
-            response = requests.request(method, url, headers=HEADERS, json=data)
- 
-            if response.status_code in [200, 201]:
-                return response.json()
-            elif response.status_code == 429:
-                logging.warning("Rate limit exceeded. Retrying...")
-                wait_time = int(response.headers.get('Retry-After', 1))
-                time.sleep(wait_time)
-                retries += 1
-                continue
-            else:
-                logging.error(f"Error: {response.status_code} - {response.text}")
-                break
- 
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"Request failed: {e}")
-            break
- 
-    logging.error("Max retries reached. Aborting request.")
-    return None
+def shopify_put(url, data):
+    r = requests.put(url, headers=HEADERS, json=data)
+    if r.status_code not in [200, 201]:
+        print("❌ PUT ERROR:", r.status_code, r.text)
+    try:
+        return r.json()
+    except ValueError:
+        return {}
  
 # -----------------------------
-# FIND PRODUCT
+# FIND PRODUCT (safe handling for empty lists)
 # -----------------------------
 def find_product_by_handle(handle):
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
     res = shopify_get(url, {"handle": handle})
-    return res.get("products", [None])[0]
+    products = res.get("products") or []
+    return products[0] if products else None
  
-def find_product_by_sku_or_barcode(sku=None, barcode=None):
+def find_product_by_sku_or_barcode(sku=None, barcode=None, title=None):
+    if title:
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+        res = shopify_get(url, {"title": title})
+        for p in res.get("products", []) or []:
+            for v in p.get("variants", []):
+                if (sku and str(v.get("sku")) == str(sku)) or (barcode and v.get("barcode") and v.get("barcode") == barcode):
+                    return p
+ 
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
     params = {"limit": 250}
-    res = shopify_get(url, params=params)
-    for p in res.get("products", []):
+    page = shopify_get(url, params=params) or {}
+    for p in page.get("products", []) or []:
         for v in p.get("variants", []):
-            if (sku and str(v.get("sku")) == str(sku)) or (barcode and v.get("barcode") == barcode):
+            if (sku and str(v.get("sku")) == str(sku)) or (barcode and v.get("barcode") and v.get("barcode") == barcode):
                 return p
     return None
  
@@ -160,35 +172,59 @@ def find_product_by_sku_or_barcode(sku=None, barcode=None):
 def build_product(p):
     title = p.get("title") or f"Product-{p.get('sku')}"
     handle = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
-    
-    costprice = float(p.get("costprice", 0) or 0)
-    weight = float(p.get("weight", 0) or 0)
-    price = calc_price(costprice, weight)
-    
+ 
+    cost = float(p.get("costprice") or 0)
+    weight = float(p.get("weight") or 0)
+ 
+    price = calc_price(cost, weight)
+ 
     vendor = last_value(p.get("productbrand"))
     product_type = last_value(p.get("productrange"))
-    tags = sanitize_tags(split_tags(p.get("productbrand")) + split_tags(p.get("productrange")) + TAGS_TO_INCLUDE + split_tags(title))
  
-    if not tags:
-        logging.warning(f"No valid tags for product: {title}")
-        
+    tags = (
+        split_tags(p.get("productbrand")) +
+        split_tags(p.get("productrange")) +
+        TAGS_TO_INCLUDE +
+        split_tags(title)
+    )
+    tags = sanitize_tags(tags)
+ 
     description = build_description(p)
  
-    images = [{"src": img.strip()} for img in re.split(r"[|,]+", p.get("imageoffloads", "")) if valid_image(img)]
-    
-    stock_qty = int(float(p.get("stock", 0)))  # Convert to int safely
-    barcode = p.get("barcode")
+    raw_images = (p.get("imageoffloads") or "")
+    raw_images = re.split(r"[|,]+", raw_images)
+    images = [{"src": img.strip()} for img in raw_images if valid_image(img)]
  
-    variants = [{
-        "price": str(price),
-        "sku": p.get("sku"),
-        "inventory_quantity": stock_qty,
-        "inventory_management": "shopify",
-        "cost": costprice,
-        "barcode": barcode,
-        "weight": weight,
-        "weight_unit": "g"
-    }]
+    variants = []
+    sizes_raw = (p.get("sizeattribute") or "")
+    sizes = [s.strip() for s in re.split(r"[|,]+", sizes_raw) if s.strip()]
+    stock_qty = int(p.get("stock") or 0)
+    barcode = p.get("barcode") if p.get("barcode") else None
+ 
+    if sizes:
+        for s in sizes:
+            variants.append({
+                "option1": s,
+                "price": price,
+                "sku": p.get("sku"),
+                "inventory_quantity": stock_qty,
+                "inventory_management": "shopify",
+                "cost": cost,
+                "barcode": barcode,
+                "weight": weight,
+                "weight_unit": "g"
+            })
+    else:
+        variants.append({
+            "price": price,
+            "sku": p.get("sku"),
+            "inventory_quantity": stock_qty,
+            "inventory_management": "shopify",
+            "cost": cost,
+            "barcode": barcode,
+            "weight": weight,
+            "weight_unit": "g"
+        })
  
     product = {
         "title": title,
@@ -198,136 +234,80 @@ def build_product(p):
         "tags": ", ".join(tags),
         "handle": handle,
         "status": "active" if stock_qty > 0 else "draft",
-        "published": stock_qty > 0,
+        "published": True if stock_qty > 0 else False,
         "variants": variants,
-        "images": images if images else []
+        **({"images": images} if images else {})
     }
+ 
+    if len(variants) > 1:
+        product["options"] = [{"name": "Size", "values": sizes}]
+ 
     return product
  
 # -----------------------------
 # LOAD XML
 # -----------------------------
 def load_xml():
-    logging.info("Downloading XML...")
-    headers = {
-        "User-Agent": "Mozilla/5.0",  # Adding User-Agent header
-    }
-    r = requests.get(XML_URL, headers=headers)
+    print("📥 Downloading XML...")
+    r = requests.get(XML_URL)
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
  
-    if r.status_code != 200:
-        logging.error(f"Error fetching XML: {r.status_code} - {r.text}")
-        return []
+    items = root.findall(".//post")
+    print(f"🔎 Found {len(items)} items")
  
-    if 'xml' not in r.headers.get('Content-Type', '').lower():
-        logging.error("Expected XML but received a different content type. Content received:")
-        logging.error(r.text)
-        return []
+    products = []
+    for item in items[:LIMIT]:
+        data = {}
+        for c in item:
+            data[c.tag.lower()] = c.text
+        products.append(data)
  
-    raw = r.content.decode('utf-8', errors='replace')
- 
-    items = []
-    try:
-        root = ET.fromstring(raw)
-        for item in root.findall(".//post")[:LIMIT] if LIMIT else root.findall(".//post"):
-            items.append({c.tag.lower(): c.text for c in item})
-        logging.info(f"Found {len(items)} items (full parse).")
-    except ET.ParseError as e:
-        logging.error(f"XML ParseError: {e}")
-    
-    return items
+    return products
  
 # -----------------------------
-# PROCESS PRODUCT
+# SYNC PRODUCT
 # -----------------------------
-def process_product(p):
-    with lock:  # Ensure thread safety
-        logging.info(f"Processing product: {p.get('title')} with SKU: {p.get('sku')}")
+def sync_product(p):
+    product_payload = build_product(p)
+    handle = product_payload.get("handle")
+    sku = p.get("sku")
+    barcode = p.get("barcode")
+    title = product_payload.get("title")
  
-        product_payload = build_product(p)
-        handle = product_payload.get("handle")
-        sku = p.get("sku")
-        barcode = p.get("barcode")
-        title = product_payload.get("title")
+    existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
  
-        existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
- 
-        logging.info(f"Constructed product payload: {product_payload}")
- 
-        if existing:
-            existing_variants = existing.get("variants", [])
-            new_variants = product_payload.get("variants", [])
- 
-            # Defensive check: Ensure variants exist
-            if not existing_variants or not new_variants:
-                logging.error(f"Existing or new variants missing for product: {title}. Skipping update.")
-                return "failed"
- 
-            # Compare existing and new variants
-            for existing_v, new_v in zip(existing_variants, new_variants):
-                if (
-                    existing_v['sku'] != new_v['sku'] or
-                    round(float(existing_v['price']), 2) != round(float(new_v['price']), 2) or
-                    existing_v['inventory_quantity'] != new_v['inventory_quantity']
-                ):
-                    logging.info(f"Updating product: {title} (ID: {existing['id']}) - Differences found.")
-                    # Update the product
-                    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-                    response = api_request('PUT', url, {"product": product_payload})
-                    if response:
-                        logging.info(f"Updated: {product_payload['title']} (ID: {existing['id']})")
-                        return "updated"
-                    else:
-                        logging.error(f"Failed to update: {product_payload['title']}")
-                        return "failed"
- 
-            logging.info(f"Product already exists and is up-to-date: {title} (ID: {existing['id']})")
-            return "exists"
+    if existing:
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+        shopify_put(url, {"product": product_payload})
+        print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+    else:
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+        res = shopify_post(url, {"product": product_payload})
+        product_id = res.get("product", {}).get("id")
+        if product_id:
+            print(f"🆕 Created: {product_payload['title']} (ID: {product_id})")
         else:
-            # Create new product if not found
-            if not product_payload.get("variants"):
-                logging.error(f"No variants found for new product: {title}. Skipping creation.")
-                return "failed"
- 
-            logging.info(f"Creating new product with payload: {product_payload}")
- 
-            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-            response = api_request('POST', url, {"product": product_payload})
-            product_id = response.get("product", {}).get("id")
-            if product_id:
-                logging.info(f"Created: {product_payload['title']} (ID: {product_id})")
-                return "created"
-            else:
-                logging.error(f"Failed to create: {product_payload['title']}")
-                return "failed"
+            print(f"❌ Failed to create: {product_payload['title']}")
  
 # -----------------------------
-# SYNC
+# RUN SYNC
 # -----------------------------
 def run_sync():
-    logging.info("START SYNC")
- 
+    print("🚀 START SYNC")
     items = load_xml()
  
-    created = 0
-    updated = 0
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {executor.submit(sync_product, p): p for p in items}
  
-    # Process products with a maximum of 2 workers to prevent race conditions
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {executor.submit(process_product, p): p for p in items}
-        for future in concurrent.futures.as_completed(futures):
+        for future in as_completed(futures):
+            p = futures[future]
             try:
-                result = future.result()
-                if result == "created":
-                    created += 1
-                elif result == "updated":
-                    updated += 1
-                elif result == "exists":
-                    continue
+                future.result()
             except Exception as e:
-                logging.error(f"Error processing product: {e}")
+                print(f"❌ Error syncing product {p.get('title')}: {e}")
  
-    logging.info("DONE")
-    logging.info(f"Created: {created}, Updated: {updated}")
+    print("✅ DONE")
  
 # -----------------------------
 # RUN
