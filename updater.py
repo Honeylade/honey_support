@@ -339,8 +339,8 @@ def run_sync():
                 print(f"❌ Error syncing product {p.get('title')}: {e}")
  
     print("✅ DONE")
- 
-# -----------------------------
+    print(f"Created: {created}, Updated: {updated}")
+ # -----------------------------
 # RUN
 # -----------------------------
 if __name__ == "__main__":
