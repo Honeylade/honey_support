@@ -340,6 +340,7 @@ def run_sync():
  
     print("✅ DONE")
     print(f"Created: {created}, Updated: {updated}")
+ 
  # -----------------------------
 # RUN
 # -----------------------------
