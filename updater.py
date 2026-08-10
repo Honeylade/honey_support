@@ -290,11 +290,14 @@ def sync_product(p):
     sku = p.get("sku")
     barcode = p.get("barcode")
     title = product_payload.get("title")
+    
+    # Print the tags for debugging
+    print(f"Tags for {title}: {product_payload.get('tags')}")
  
     existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode, title=title)
  
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json" if existing else f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-    
+ 
     for attempt in range(3):  # Retry up to 3 times
         try:
             if existing:
@@ -314,7 +317,7 @@ def sync_product(p):
         except Exception as e:
             print(f"❌ Error syncing product {title}: {e}")
             break  # Exit on other errors
- 
+
 # -----------------------------
 # RUN SYNC
 # -----------------------------
