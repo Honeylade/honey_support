@@ -189,6 +189,10 @@ def build_product(p):
     title = p.get("title") or f"Product-{p.get('sku')}"
     handle = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
  
+    # Replace dashes with spaces and split into tags
+    title_for_tags = title.replace('-', ' ')  # Replace dashes with spaces
+    additional_tags = split_tags(title_for_tags)  # Split into individual tags
+ 
     cost = float(p.get("costprice") or 0)
     weight = float(p.get("weight") or 0)
  
@@ -201,7 +205,7 @@ def build_product(p):
         split_tags(p.get("productbrand")) +
         split_tags(p.get("productrange")) +
         TAGS_TO_INCLUDE +
-        split_tags(title)
+        additional_tags  # Add the split title tags
     )
     tags = sanitize_tags(tags)
  
