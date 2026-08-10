@@ -328,7 +328,13 @@ def run_sync():
         for future in as_completed(futures):
             p = futures[future]
             try:
-                future.result()
+                result = future.result()
+                if result == "created":
+                    created += 1
+                elif result == "updated":
+                    updated += 1
+                elif result == "exists":
+                    continue  # Count this as an existing product
             except Exception as e:
                 print(f"❌ Error syncing product {p.get('title')}: {e}")
  
