@@ -78,9 +78,10 @@ def sanitize_tags(tags):
     for tag in tags:
         if not tag:
             continue
-        t = tag.replace('&', 'and').strip()
+        # Remove invalid characters and trim
+        t = re.sub(r'[^a-zA-Z0-9\s\-]', '', tag).strip()
         if len(t) > 255:
-            t = t[:255]
+            t = t[:255]  # Truncate to 255 characters
         if t.lower() not in seen:
             seen.add(t.lower())
             sanitized.append(t)
