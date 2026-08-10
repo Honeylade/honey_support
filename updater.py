@@ -322,7 +322,7 @@ def run_sync():
     print("🚀 START SYNC")
     items = load_xml()
  
-    with ThreadPoolExecutor(max_workers=5) as executor:  # Increased to 5 workers
+    with ThreadPoolExecutor(max_workers=8) as executor:  # Increased to 8 workers
         futures = {executor.submit(sync_product, p): p for p in items}
  
         for future in as_completed(futures):
