@@ -72,21 +72,28 @@ def split_tags(val):
         return []
     return [t.strip() for t in re.split(r"[>\|,;/\s]+", val) if t.strip()]
  
+# -----------------------------
+# SANITIZE TAGS
+# -----------------------------
 def sanitize_tags(tags):
     sanitized = []
     seen = set()
     for tag in tags:
         if not tag:
             continue
-        # Remove invalid characters and trim
-        t = re.sub(r'[^a-zA-Z0-9\s\-]', '', tag).strip()
+        # Replace HTML entities and remove invalid characters
+        t = tag.replace("&amp;", "and").strip()  # Replace HTML entity
+        t = ''.join(e for e in t if e.isalnum() or e.isspace() or e == '-')  # Allow alphanumeric, space, and hyphen
         if len(t) > 255:
             t = t[:255]  # Truncate to 255 characters
-        if t and t.lower() not in seen:  # Check for emptiness and uniqueness
+        if t and t.lower() not in seen:
             seen.add(t.lower())
             sanitized.append(t)
-    return sanitized
- 
+    return sanitized[:250]  # Limit to 250 tags
+
+# -----------------------------
+# BUILD DESCRIPTION
+# -----------------------------
 def build_description(p):
     bullets = []
     for i in range(1, 11):
@@ -265,7 +272,7 @@ def load_xml():
         products.append(data)
  
     return products
- 
+
 # -----------------------------
 # SYNC PRODUCT
 # -----------------------------
@@ -285,8 +292,8 @@ def sync_product(p):
         # Update existing product
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
         response = shopify_put(url, {"product": product_payload})
- 
-        if response:
+
+     if response:
             print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
         else:
             print(f"❌ Failed to update: {product_payload['title']}")
@@ -299,7 +306,38 @@ def sync_product(p):
             print(f"➕ Created: {product_payload['title']} (ID: {response['product']['id']})")
         else:
             print(f"❌ Failed to create: {product_payload['title']}")
+
+# -----------------------------
+# SYNC PRODUCT
+# -----------------------------
+def sync_product(p):
+    product_payload = build_product(p)
+    handle = product_payload.get("handle")
+    sku = p.get("sku")
+    barcode = p.get("barcode")
  
+    print(f"🔍 Checking for product: Handle: {handle}, SKU: {sku}, Barcode: {barcode}")
+ 
+    existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
+ 
+    if existing:
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+        response = requests.put(url, json={"product": product_payload}, headers=HEADERS)
+        
+        if response.status_code in [200, 201]:
+            print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+        else:
+            print(f"❌ PUT ERROR: {response.status_code} {response.json()}")
+    else:
+        # Create a new product if it doesn't exist
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+        response = requests.post(url, json={"product": product_payload}, headers=HEADERS)
+ 
+        if response.status_code in [200, 201]:
+            print(f"➕ Created: {product_payload['title']} (ID: {response.json()['product']['id']})")
+        else:
+            print(f"❌ POST ERROR: {response.status_code} {response.json()}")
+  
 # -----------------------------
 # RUN SYNC
 # -----------------------------
