@@ -282,21 +282,26 @@ def sync_product(p, counters):
     barcode = p.get("barcode")
     title = product_payload.get("title")
  
- # Remove or comment out the following line to stop printing the check message 
- # print(f"🔍 Checking for product: Handle: {handle}, SKU: {sku}, Barcode: {barcode}")
- 
+    # Check for existing product by handle or SKU/barcode
     existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
  
     if existing:
-        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-        response = shopify_put(url, {"product": product_payload})
+        # If the existing product is found, compare details to avoid unnecessary updates
+        # For example, check if the price or inventory has changed
+        if existing['variants'][0]['price'] != product_payload['variants'][0]['price'] or \
+           existing['variants'][0]['inventory_quantity'] != product_payload['variants'][0]['inventory_quantity']:
+            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+            response = shopify_put(url, {"product": product_payload})
  
-        if response:
-            print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
-            counters['updated'] += 1
+            if response:
+                print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+                counters['updated'] += 1
+            else:
+                print(f"❌ Failed to update: {product_payload['title']}")
         else:
-            print(f"❌ Failed to update: {product_payload['title']}")
+            print(f"✅ No changes for: {product_payload['title']} (ID: {existing['id']})")
     else:
+        # Only create if product does not exist
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
         response = shopify_post(url, {"product": product_payload})
  
@@ -305,7 +310,7 @@ def sync_product(p, counters):
             counters['created'] += 1
         else:
             print(f"❌ Failed to create: {product_payload['title']}")
- 
+
 # -----------------------------
 # RUN SYNC
 # -----------------------------
