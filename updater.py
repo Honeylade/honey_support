@@ -29,7 +29,7 @@ TAGS_TO_INCLUDE = [
     "themed gifts", "Honeylade", "flags", "sports gifts",
     "fan accessories", "novelty gifts", "sports fans"
 ]
-  
+ 
 # -----------------------------
 # PRICE LOGIC
 # -----------------------------
@@ -284,28 +284,26 @@ def sync_product(p, counters):
  
     print(f"🔍 Checking for product: Handle: {handle}, SKU: {sku}, Barcode: {barcode}")
  
-    # Use the lock to ensure only one thread accesses this block at a time
-    with lock:
-        existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
+    existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
  
-        if existing:
-            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-            response = shopify_put(url, {"product": product_payload})
+    if existing:
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+        response = shopify_put(url, {"product": product_payload})
  
-            if response:
-                print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
-                counters['updated'] += 1
-            else:
-                print(f"❌ Failed to update: {product_payload['title']}")
+        if response:
+            print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+            counters['updated'] += 1
         else:
-            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-            response = shopify_post(url, {"product": product_payload})
+            print(f"❌ Failed to update: {product_payload['title']}")
+    else:
+        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+        response = shopify_post(url, {"product": product_payload})
  
-            if response:
-                print(f"➕ Created: {product_payload['title']} (ID: {response['product']['id']})")
-                counters['created'] += 1
-            else:
-                print(f"❌ Failed to create: {product_payload['title']}")
+        if response:
+            print(f"➕ Created: {product_payload['title']} (ID: {response['product']['id']})")
+            counters['created'] += 1
+        else:
+            print(f"❌ Failed to create: {product_payload['title']}")
  
 # -----------------------------
 # RUN SYNC
@@ -315,7 +313,7 @@ def run_sync():
     items = load_xml()
     counters = {'updated': 0, 'created': 0}
  
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(sync_product, p, counters): p for p in items}
  
         for future in as_completed(futures):
