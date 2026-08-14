@@ -3,6 +3,7 @@ import asyncio
 import aiohttp
 import xml.etree.ElementTree as ET
 import re
+import random
  
 # -----------------------------
 # CONFIG
@@ -267,7 +268,7 @@ async def load_xml():
 # -----------------------------
 # SYNC PRODUCT
 # -----------------------------
-async def sync_product(session, p, counters):
+async def sync_product(session, p, counters, backoff=1):
     product_payload = build_product(p)
     handle = product_payload.get("handle")
     sku = p.get("sku")
@@ -298,9 +299,11 @@ async def sync_product(session, p, counters):
     else:
         if response and 'errors' in response:
             if 'Exceeded 2 calls per second' in response['errors']:
-                print("💔 Rate limit hit. Retrying...")
-                await asyncio.sleep(5)  # Wait longer before retrying
-                response = await sync_product(session, p, counters)  # Retry the sync
+                print(f"💔 Rate limit hit. Waiting for {backoff} seconds before retrying...")
+                await asyncio.sleep(backoff)
+                # Exponential backoff
+                new_backoff = min(backoff * 2, 30) + random.uniform(0, 1)  # Adding some randomness to avoid thundering herd problem
+                return await sync_product(session, p, counters, new_backoff)  # Retry the sync
         print(f"❌ Failed to process: {product_payload['title']}")
  
     await asyncio.sleep(1)  # Basic rate limiting for other requests
