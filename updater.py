@@ -297,6 +297,8 @@ async def sync_product(session, p, counters):
         else:
             print(f"❌ Failed to create: {product_payload['title']}")
  
+    await asyncio.sleep(1)  # Rate limiting: sleep for 1 second between requests
+ 
 # -----------------------------
 # RUN SYNC
 # -----------------------------
