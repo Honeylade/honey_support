@@ -288,10 +288,11 @@ def sync_product(p, counters):
  
     print(f"🔍 Checking for product: Handle: {handle}, SKU: {sku}, Barcode: {barcode}")
  
-    # Use the lock to ensure only one thread accesses this block at a time
-    with lock:
-        existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
+    # Check for existing product without locking
+    existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
  
+    # Now we lock only the update/create section
+    with lock:
         if existing:
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
             response = shopify_put(url, {"product": product_payload})
