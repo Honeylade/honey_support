@@ -278,26 +278,32 @@ async def sync_product(session, p, counters):
  
     existing = await find_product_by_handle(session, handle) or await find_product_by_sku_or_barcode(session, sku=sku, barcode=barcode)
  
-    if existing:
-        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-        response = await shopify_put(session, url, {"product": product_payload})
+    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/"
+    response = None
  
-        if response:
+    if existing:
+        url += f"{existing['id']}.json"
+        response = await shopify_put(session, url, {"product": product_payload})
+    else:
+        url += "json"
+        response = await shopify_post(session, url, {"product": product_payload})
+ 
+    if response:
+        if existing:
             print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
             counters['updated'] += 1
         else:
-            print(f"❌ Failed to update: {product_payload['title']}")
-    else:
-        url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-        response = await shopify_post(session, url, {"product": product_payload})
- 
-        if response:
             print(f"➕ Created: {product_payload['title']} (ID: {response['product']['id']})")
             counters['created'] += 1
-        else:
-            print(f"❌ Failed to create: {product_payload['title']}")
+    else:
+        if response and 'errors' in response:
+            if 'Exceeded 2 calls per second' in response['errors']:
+                print("💔 Rate limit hit. Retrying...")
+                await asyncio.sleep(5)  # Wait longer before retrying
+                response = await sync_product(session, p, counters)  # Retry the sync
+        print(f"❌ Failed to process: {product_payload['title']}")
  
-    await asyncio.sleep(1)  # Rate limiting: sleep for 1 second between requests
+    await asyncio.sleep(1)  # Basic rate limiting for other requests
  
 # -----------------------------
 # RUN SYNC
