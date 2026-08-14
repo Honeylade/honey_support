@@ -285,9 +285,7 @@ def sync_product(p, counters):
     sku = p.get("sku")
     barcode = p.get("barcode")
     title = product_payload.get("title")
- 
-    print(f"🔍 Checking for product: Handle: {handle}, SKU: {sku}, Barcode: {barcode}")
- 
+     
     # Check for existing product without locking
     existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
  
@@ -320,7 +318,7 @@ def run_sync():
     items = load_xml()
     counters = {'updated': 0, 'created': 0}
  
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=12) as executor:
         futures = {executor.submit(sync_product, p, counters): p for p in items}
  
         for future in as_completed(futures):
