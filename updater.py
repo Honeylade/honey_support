@@ -282,7 +282,8 @@ def sync_product(p, counters):
     barcode = p.get("barcode")
     title = product_payload.get("title")
  
-    print(f"🔍 Checking for product: Handle: {handle}, SKU: {sku}, Barcode: {barcode}")
+ # Remove or comment out the following line to stop printing the check message 
+ # print(f"🔍 Checking for product: Handle: {handle}, SKU: {sku}, Barcode: {barcode}")
  
     existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
  
