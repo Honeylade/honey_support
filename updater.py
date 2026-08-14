@@ -189,7 +189,7 @@ def build_product(p):
     product_type = last_value(p.get("productrange"))
  
     tags = (
-        split_tags(p.get("productbrand")) +
+        [p.get("productbrand")] +  # Add the whole product brand directly
         [p.get("productrange")] +  # Add the whole product range directly
         TAGS_TO_INCLUDE +
         split_tags(title)
