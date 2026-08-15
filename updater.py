@@ -316,27 +316,39 @@ def update_existing_product(existing, product_payload, counters):
     if existing['variants'][0]['price'] != product_payload['variants'][0]['price'] or \
        existing['variants'][0]['inventory_quantity'] != product_payload['variants'][0]['inventory_quantity']:
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-        response = shopify_put(url, {"product": product_payload})
- 
-        if response:
-            print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
-            counters['updated'] += 1
-        else:
-            print(f"❌ Failed to update: {product_payload['title']}")
+        
+        try:
+            response = shopify_put(url, {"product": product_payload})
+            if response:
+                print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+                counters['updated'] += 1
+            else:
+                print(f"❌ Failed to update: {product_payload['title']}")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                print("⚠️ Rate limit exceeded while updating. Waiting before retrying...")
+                time.sleep(3)  # Wait before retrying
+                update_existing_product(existing, product_payload, counters)  # Retry the update
     else:
         print(f"✅ No changes for: {product_payload['title']} (ID: {existing['id']})")
  
 def create_new_product(product_payload, counters):
     """Creates a new product in the Shopify store."""
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
-    response = shopify_post(url, {"product": product_payload})
- 
-    if response:
-        print(f"➕ Created: {product_payload['title']} (ID: {response['product']['id']})")
-        counters['created'] += 1
-    else:
-        print(f"❌ Failed to create: {product_payload['title']}")
- 
+    
+    try:
+        response = shopify_post(url, {"product": product_payload})
+        if response:
+            print(f"➕ Created: {product_payload['title']} (ID: {response['product']['id']})")
+            counters['created'] += 1
+        else:
+            print(f"❌ Failed to create: {product_payload['title']}")
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:
+            print("⚠️ Rate limit exceeded while creating. Waiting before retrying...")
+            time.sleep(3)  # Wait before retrying
+            create_new_product(product_payload, counters)  # Retry the creation
+
 # -----------------------------
 # RUN SYNC
 # -----------------------------
