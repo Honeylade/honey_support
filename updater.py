@@ -3,6 +3,7 @@ import requests
 import xml.etree.ElementTree as ET
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
  
 # -----------------------------
 # CONFIG
@@ -345,9 +346,7 @@ def run_sync():
     # Refresh the access token at the start
     new_token = refresh_access_token()
     if new_token:
-        global ACCESS_TOKEN
-        ACCESS_TOKEN = new_token  # Update the global ACCESS_TOKEN variable
-        HEADERS["X-Shopify-Access-Token"] = ACCESS_TOKEN  # Update headers with the new token
+        HEADERS["X-Shopify-Access-Token"] = new_token  # Update headers with the new token
  
     items = load_xml()
     counters = {'updated': 0, 'created': 0}
