@@ -48,7 +48,7 @@ def get_access_token():
         "client_secret": os.getenv("CLIENT_SECRET"),
         "grant_type": "client_credentials"
     }
-    
+ 
     print(f"Requesting access token with {data}")  # Debug line
  
     try:
