@@ -48,11 +48,18 @@ def get_access_token():
         "client_secret": os.getenv("CLIENT_SECRET"),
         "grant_type": "client_credentials"
     }
+    
+    print(f"Requesting access token with {data}")  # Debug line
  
-    response = requests.post(url, json=data)
-    response.raise_for_status()
+    try:
+        response = requests.post(url, json=data)
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP error: {e}")
+        print(f"Response content: {response.content.decode()}")
+        raise
+ 
     token_data = response.json()
- 
     _token_cache["access_token"] = token_data["access_token"]
     _token_cache["expires_at"] = time.time() + token_data.get("expires_in", 86400)
  
