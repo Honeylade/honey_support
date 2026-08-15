@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # CONFIG
 # -----------------------------
 SHOP_URL = os.getenv("SHOP_URL")
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 XML_URL = os.getenv("XML_URL")
 API_VERSION = "2024-01"
  
