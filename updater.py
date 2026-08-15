@@ -37,8 +37,8 @@ def refresh_access_token():
     url = f"https://{SHOP_URL}/admin/oauth/access_token"
     payload = {
         "grant_type": "client_credentials",
-        "client_id": os.getenv("CLIENT_ID"),  # Use CLIENT_ID
-        "client_secret": os.getenv("CLIENT_SECRET")  # Use CLIENT_SECRET
+        "CLIENT_ID": os.getenv("CLIENT_ID"),  # Use CLIENT_ID
+        "CLIENT_SECRET": os.getenv("CLIENT_SECRET")  # Use CLIENT_SECRET
     }
     response = requests.post(url, json=payload)
  
