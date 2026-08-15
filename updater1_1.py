@@ -33,27 +33,41 @@ TAGS_TO_INCLUDE = [
 # -----------------------------
 # ACCESS TOKEN REFRESH LOGIC
 # -----------------------------
-def refresh_access_token():
-    url = f"https://{SHOP_URL}/admin/oauth/access_token"
-    payload = {
-        "grant_type": "client_credentials",
-        "client_id": os.getenv("CLIENT_ID"),
-        "client_secret": os.getenv("CLIENT_SECRET")
+# Cache token in memory
+_token_cache = {
+    "access_token": None,
+    "expires_at": 0
+}
+
+def get_access_token():
+    # Return cached token if still valid (with 60s buffer)
+    if _token_cache["access_token"] and time.time() < _token_cache["expires_at"] - 60:
+        return _token_cache["access_token"]
+
+    # Request a new token
+    url = f"https://{SHOP}/admin/oauth/access_token"
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "client_credentials"
     }
-    response = requests.post(url, json=payload)
- 
-    if response.status_code == 200:
-        token_data = response.json()
-        new_token = token_data.get("access_token")
-        if new_token:
-            print("🔑 Token refreshed successfully.")
-            HEADERS["X-Shopify-Access-Token"] = new_token  # Update headers with the new token
-            return new_token
-    else:
-        print(f"❌ Failed to refresh token: {response.status_code}, {response.text}")
- 
-    return None
- 
+
+    response = requests.post(url, json=data)
+    response.raise_for_status()
+    token_data = response.json()
+
+    # Cache it with expiry
+    _token_cache["access_token"] = token_data["access_token"]
+    _token_cache["expires_at"] = time.time() + token_data.get("expires_in", 86400)
+
+    return _token_cache["access_token"]
+
+# Usage
+def make_api_call():
+    token = get_access_token()
+    headers = {"X-Shopify-Access-Token": token}
+    # ... your API call here
+
 # -----------------------------
 # PRICE LOGIC
 # -----------------------------
