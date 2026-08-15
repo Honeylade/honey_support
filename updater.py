@@ -17,8 +17,8 @@ if LIMIT in ["None", "0", None]:
 else:
     LIMIT = int(LIMIT)
  
+# Initial headers without the access token
 HEADERS = {
-    "X-Shopify-Access-Token": ACCESS_TOKEN,
     "Content-Type": "application/json",
     "Accept": "application/json"
 }
@@ -36,8 +36,8 @@ def refresh_access_token():
     url = f"https://{SHOP_URL}/admin/oauth/access_token"
     payload = {
         "grant_type": "client_credentials",
-        "CLIENT_ID": os.getenv("CLIENT_ID"),  # Use CLIENT_ID
-        "CLIENT_SECRET": os.getenv("CLIENT_SECRET")  # Use CLIENT_SECRET
+        "client_id": os.getenv("CLIENT_ID"),
+        "client_secret": os.getenv("CLIENT_SECRET")
     }
     response = requests.post(url, json=payload)
  
@@ -46,6 +46,7 @@ def refresh_access_token():
         new_token = token_data.get("access_token")
         if new_token:
             print("🔑 Token refreshed successfully.")
+            HEADERS["X-Shopify-Access-Token"] = new_token  # Update headers with the new token
             return new_token
     else:
         print(f"❌ Failed to refresh token: {response.status_code}, {response.text}")
