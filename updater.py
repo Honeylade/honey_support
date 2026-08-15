@@ -345,6 +345,7 @@ def run_sync():
     print("🚀 START SYNC")
     
     # Refresh the access token at the start
+    token = get_access_token()
     HEADERS["X-Shopify-Access-Token"] = token  # Update headers with the new token
  
     items = load_xml()
