@@ -3,12 +3,12 @@ import requests
 import xml.etree.ElementTree as ET
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
  
 # -----------------------------
 # CONFIG
 # -----------------------------
 SHOP_URL = os.getenv("SHOP_URL")
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 XML_URL = os.getenv("XML_URL")
 API_VERSION = "2024-01"
  
@@ -19,7 +19,6 @@ else:
     LIMIT = int(LIMIT)
  
 HEADERS = {
-    "X-Shopify-Access-Token": ACCESS_TOKEN,
     "Content-Type": "application/json",
     "Accept": "application/json"
 }
@@ -29,6 +28,51 @@ TAGS_TO_INCLUDE = [
     "themed gifts", "Honeylade", "flags", "sports gifts",
     "fan accessories", "novelty gifts", "sports fans"
 ]
+
+# -----------------------------
+# ACCESS TOKEN MANAGEMENT
+# -----------------------------
+_token_cache = {
+    "access_token": None,
+    "expires_at": 0
+}
+ 
+def get_access_token():
+    """Fetches and caches the access token."""
+    if _token_cache["access_token"] and time.time() < _token_cache["expires_at"] - 60:
+        return _token_cache["access_token"]
+ 
+    url = f"https://{SHOP_URL}/admin/oauth/access_token"
+    data = {
+        "client_id": os.getenv("CLIENT_ID"),
+        "client_secret": os.getenv("CLIENT_SECRET"),
+        "grant_type": "client_credentials"
+    }
+ 
+    print(f"Requesting access token with {data}")  # Debug line
+ 
+    try:
+        response = requests.post(url, json=data)
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP error: {e}")
+        print(f"Response content: {response.content.decode()}")
+        raise
+ 
+    token_data = response.json()
+    _token_cache["access_token"] = token_data["access_token"]
+    _token_cache["expires_at"] = time.time() + token_data.get("expires_in", 86400)
+ 
+    return _token_cache["access_token"]
+ 
+# -----------------------------
+# API CALLS
+# -----------------------------
+def make_api_call():
+    """Example function to demonstrate API call usage."""
+    token = get_access_token()
+    headers = {"X-Shopify-Access-Token": token}
+    # ... your API call here
  
 # -----------------------------
 # PRICE LOGIC
@@ -318,6 +362,11 @@ def sync_product(p, counters):
 # -----------------------------
 def run_sync():
     print("🚀 START SYNC")
+ 
+    # Refresh the access token at the start
+    token = get_access_token()
+    HEADERS["X-Shopify-Access-Token"] = token  # Update headers with the new token
+ 
     items = load_xml()
     counters = {'updated': 0, 'created': 0}
  
