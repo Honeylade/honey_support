@@ -187,13 +187,14 @@ def build_product(p):
  
     vendor = last_value(p.get("productbrand"))
     product_type = last_value(p.get("productrange"))
- 
+
     tags = (
-        [p.get("productbrand")] +  # Add the whole product brand directly
+        split_tags(p.get("productbrand")) +
         [p.get("productrange")] +  # Add the whole product range directly
         TAGS_TO_INCLUDE +
-        split_tags(title)
+        [title] # Add the whole title directly
     )
+
     tags = sanitize_tags(tags)
  
     description = build_description(p)
