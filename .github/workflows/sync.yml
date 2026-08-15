@@ -26,10 +26,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install aiohttp
+          pip install requests python-dotenv
 
       - name: Run honey sync script
         env:
           SHOP_URL: ${{ secrets.SHOP_URL }}
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           XML_URL: ${{ secrets.XML_URL }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          LIMIT: ${{ secrets.LIMIT }}
         run: python updater.py
