@@ -309,7 +309,12 @@ def load_xml():
     print("📥 Downloading XML...")
     r = requests.get(XML_URL)
     r.raise_for_status()
-    root = ET.fromstring(r.content)
+    
+    try:
+        root = ET.fromstring(r.content)
+    except ParseError as e:
+        print(f"❌ XML Parse Error: {e}")
+        return []  # Return an empty list or handle the error as needed
  
     items = root.findall(".//post")
     print(f"🔎 Found {len(items)} items")
