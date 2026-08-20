@@ -291,8 +291,10 @@ def build_product(p):
         "product_type": product_type,
         "tags": ", ".join(tags),
         "handle": handle,
-        "status": "active" if stock_qty > 0 else "draft",
-        "published": True if stock_qty > 0 else False,
+        # Set status to "active" if stock_qty is 1 or more, otherwise set to "draft"
+        "status": "active" if stock_qty >= 1 else "draft",
+        # Set published to True if stock_qty is 1 or more
+        "published": True if stock_qty >= 1 else False,
         "variants": variants,
         **({"images": images} if images else {})
     }
