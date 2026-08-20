@@ -353,7 +353,12 @@ def sync_product(p, counters):
             product_payload['status'] = "active"
             product_payload['published'] = True  # Ensure it's published as well
  
-        if needs_update or existing['status'] == "draft":
+        # Check if the product is currently active and should be made draft
+        elif existing['status'] == "active" and product_payload['variants'][0]['inventory_quantity'] == 0:
+            product_payload['status'] = "draft"
+            product_payload['published'] = False  # Ensure it's unpublished
+ 
+        if needs_update or existing['status'] in ["draft", "active"]:
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
             response = shopify_put(url, {"product": product_payload})
  
