@@ -387,7 +387,7 @@ def sync_product(p, counters, resync_quantity_counter):
         # Check for price change (with rounding)
         if round(float(existing_price), 2) != round(float(new_price), 2):
             needs_update = True
-            
+ 
         # Check for inventory change
         if existing_inventory_quantity != new_inventory_quantity:
             needs_update = True
@@ -395,9 +395,8 @@ def sync_product(p, counters, resync_quantity_counter):
         # Check for status change
         if existing_status != new_status:
             needs_update = True
-       
+ 
         if needs_update:
-            # logging.info("🔄 Update needed")
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
             response = shopify_put(url, {"product": product_payload})
  
