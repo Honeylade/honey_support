@@ -341,7 +341,6 @@ def sync_product(p, counters, resync_quantity_counter):
     existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
  
     if existing:
-        # Initialize needs_update flag
         needs_update = False
         meaningful_change = False
  
@@ -361,9 +360,9 @@ def sync_product(p, counters, resync_quantity_counter):
             meaningful_change = True
             print(f"Price changed: {existing_price} -> {new_price}")
  
-        # Check for inventory change and apply status logic
+        # Check for inventory change
         if existing_inventory_quantity != new_inventory_quantity:
-            # Status change logic based on inventory
+            # Update status based on inventory
             if existing_status == "draft" and new_inventory_quantity >= 1:
                 product_payload['status'] = "active"
                 product_payload['published'] = True
@@ -380,21 +379,20 @@ def sync_product(p, counters, resync_quantity_counter):
  
             print(f"Inventory changed: {existing_inventory_quantity} -> {new_inventory_quantity}")
  
-        # Log only if there's a meaningful change
-        if needs_update:
-            if meaningful_change:
-                print("🔄 Update needed")
-                url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
-                response = shopify_put(url, {"product": product_payload})
+        # Log updates only if there's a meaningful change
+        if needs_update and meaningful_change:
+            print("🔄 Update needed")
+            url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
+            response = shopify_put(url, {"product": product_payload})
  
-                if response:
-                    print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
-                    counters['updated'] += 1
-                    resync_quantity_counter += new_inventory_quantity
-                else:
-                    print(f"❌ Failed to update: {product_payload['title']}")
+            if response:
+                print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
+                counters['updated'] += 1
+                resync_quantity_counter += new_inventory_quantity
             else:
-                print("✅ No meaningful changes detected.")
+                print(f"❌ Failed to update: {product_payload['title']}")
+        elif not meaningful_change:
+            print("✅ No meaningful changes detected.")
         else:
             print("✅ No update needed")
             print(f"✅ No changes for: {product_payload['title']} (ID: {existing['id']})")
@@ -408,6 +406,7 @@ def sync_product(p, counters, resync_quantity_counter):
             counters['created'] += 1
         else:
             print(f"❌ Failed to create: {product_payload['title']}")
+         
 # -----------------------------
 # CHECK FOR STOCK CHANGES
 # -----------------------------
