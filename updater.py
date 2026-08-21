@@ -362,25 +362,23 @@ def sync_product(p, counters, resync_quantity_counter):
  
         # Check for inventory change
         if existing_inventory_quantity != new_inventory_quantity:
-            # Update status based on inventory
             if existing_status == "draft" and new_inventory_quantity >= 1:
                 product_payload['status'] = "active"
                 product_payload['published'] = True
                 needs_update = True
                 meaningful_change = True
-                print(f"Status changed from draft to active due to inventory change.")
- 
+                print("Status changed from draft to active due to inventory change.")
             elif existing_status == "active" and new_inventory_quantity == 0:
                 product_payload['status'] = "draft"
                 product_payload['published'] = False
                 needs_update = True
                 meaningful_change = True
-                print(f"Status changed from active to draft due to inventory change.")
+                print("Status changed from active to draft due to inventory change.")
  
             print(f"Inventory changed: {existing_inventory_quantity} -> {new_inventory_quantity}")
  
         # Log updates only if there's a meaningful change
-        if needs_update and meaningful_change:
+        if needs_update:
             print("🔄 Update needed")
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
             response = shopify_put(url, {"product": product_payload})
@@ -391,11 +389,8 @@ def sync_product(p, counters, resync_quantity_counter):
                 resync_quantity_counter += new_inventory_quantity
             else:
                 print(f"❌ Failed to update: {product_payload['title']}")
-        elif not meaningful_change:
-            print("✅ No meaningful changes detected.")
         else:
-            print("✅ No update needed")
-            print(f"✅ No changes for: {product_payload['title']} (ID: {existing['id']})")
+            print("✅ No updates needed for: " + product_payload['title'])
     else:
         # Handle creation of new products
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
