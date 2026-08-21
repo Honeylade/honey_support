@@ -310,7 +310,7 @@ def load_xml():
     print("📥 Downloading XML...")
     r = requests.get(XML_URL)
     r.raise_for_status()
-    
+ 
     try:
         root = ET.fromstring(r.content)
     except ParseError as e:
@@ -345,6 +345,9 @@ def sync_product(p, counters, resync_quantity_counter):
         # Determine if a meaningful update is needed
         needs_update = False
  
+        # Reset needs_update at the start
+        needs_update = False 
+ 
         # Check if price or inventory quantity has changed
         existing_price = existing['variants'][0]['price']
         existing_inventory_quantity = existing['variants'][0]['inventory_quantity']
@@ -360,7 +363,8 @@ def sync_product(p, counters, resync_quantity_counter):
             needs_update = True
         if existing_status != new_status:
             needs_update = True
-         # Log comparison results for debugging
+ 
+        # Log comparison results for debugging
         print(f"Price changed: {existing_price} -> {new_price}")
         print(f"Inventory changed: {existing_inventory_quantity} -> {new_inventory_quantity}")
         print(f"Status changed: {existing_status} -> {new_status}")
@@ -398,7 +402,7 @@ def sync_product(p, counters, resync_quantity_counter):
             counters['created'] += 1
         else:
             print(f"❌ Failed to create: {product_payload['title']}")
-
+ 
 # -----------------------------
 # CHECK FOR STOCK CHANGES
 # -----------------------------
