@@ -345,9 +345,6 @@ def sync_product(p, counters, resync_quantity_counter):
         # Determine if a meaningful update is needed
         needs_update = False
  
-        # Reset needs_update at the start
-        needs_update = False 
- 
         # Check if price or inventory quantity has changed
         existing_price = existing['variants'][0]['price']
         existing_inventory_quantity = existing['variants'][0]['inventory_quantity']
@@ -357,17 +354,16 @@ def sync_product(p, counters, resync_quantity_counter):
         new_inventory_quantity = product_payload['variants'][0]['inventory_quantity']
         new_status = product_payload['status']
  
+        # Only set needs_update to True if there are actual changes
         if existing_price != new_price:
             needs_update = True
+            print(f"Price changed: {existing_price} -> {new_price}")
         if existing_inventory_quantity != new_inventory_quantity:
             needs_update = True
+            print(f"Inventory changed: {existing_inventory_quantity} -> {new_inventory_quantity}")
         if existing_status != new_status:
             needs_update = True
- 
-        # Log comparison results for debugging
-        print(f"Price changed: {existing_price} -> {new_price}")
-        print(f"Inventory changed: {existing_inventory_quantity} -> {new_inventory_quantity}")
-        print(f"Status changed: {existing_status} -> {new_status}")
+            print(f"Status changed: {existing_status} -> {new_status}")
  
         # Check if the product is currently in draft and should be made active
         if existing['status'] == "draft" and new_inventory_quantity >= 1:
