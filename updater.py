@@ -360,6 +360,17 @@ def load_xml():
     return products
  
 # -----------------------------
+# PARSE INVENTORY QUANTITY
+# -----------------------------
+def parse_inventory_quantity(quantity):
+    """Safely parse inventory quantity to int, handling floats represented as strings."""
+    try:
+        return int(float(quantity))  # Convert to float first and then to int
+    except ValueError as e:
+        logging.error(f"Error converting inventory quantity: {quantity} - {e}")
+        return 0  # or some other default value or handling logic
+ 
+# -----------------------------
 # SYNC PRODUCT
 # -----------------------------
 def sync_product(p, counters, resync_quantity_counter):
@@ -374,14 +385,14 @@ def sync_product(p, counters, resync_quantity_counter):
     if existing:
         needs_update = False
  
-        # Get existing values
+        # Get existing values with robust parsing
         existing_price = existing['variants'][0]['price']
-        existing_inventory_quantity = existing['variants'][0]['inventory_quantity']
+        existing_inventory_quantity = parse_inventory_quantity(existing['variants'][0]['inventory_quantity'])
         existing_status = existing['status']
  
         # New values
         new_price = product_payload['variants'][0]['price']
-        new_inventory_quantity = product_payload['variants'][0]['inventory_quantity']
+        new_inventory_quantity = parse_inventory_quantity(product_payload['variants'][0]['inventory_quantity'])
         new_status = product_payload['status']
  
         # Check for price change (with rounding)
