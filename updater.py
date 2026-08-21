@@ -133,8 +133,8 @@ def shopify_put(url, data, retries=3):
 # -----------------------------
 def calc_price(cost, weight):
     """Calculate the final product price based on cost and weight."""
-    cost = float(cost or 0)
-    weight = float(weight or 0)
+    cost = cost or 0
+    weight = weight or 0
  
     shipping = 3.99 if weight < 300 else 4.99 if weight < 2000 else 18
     margin = 0.30 if cost < 5 else 0.25 if cost < 10 else 0.20
@@ -257,8 +257,8 @@ def build_product(p):
     title = p.get("title") or f"Product-{p.get('sku')}"
     handle = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
  
-    cost = float(p.get("costprice") or 0)
-    weight = float(p.get("weight") or 0)
+    cost = p.get("costprice") or 0
+    weight = p.get("weight") or 0
  
     price = calc_price(cost, weight)
  
@@ -365,7 +365,7 @@ def load_xml():
 def parse_inventory_quantity(quantity):
     """Safely parse inventory quantity to int, handling floats represented as strings."""
     try:
-        return int(float(quantity))  # Convert to float first and then to int
+        return int(quantity)  # Directly convert to int
     except ValueError as e:
         logging.error(f"Error converting inventory quantity: {quantity} - {e}")
         return 0  # or some other default value or handling logic
