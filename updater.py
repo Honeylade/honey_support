@@ -79,7 +79,7 @@ def get_access_token():
 def shopify_get(url, params=None):
     """Perform a GET request to Shopify API."""
     try:
-        r = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        r = requests.get(url, headers=HEADERS, params=params, timeout=20)  # Increased timeout
         r.raise_for_status()
         return r.json()
     except requests.exceptions.RequestException as e:
@@ -89,22 +89,25 @@ def shopify_get(url, params=None):
 def shopify_post(url, data):
     """Perform a POST request to Shopify API."""
     try:
-        r = requests.post(url, headers=HEADERS, json=data, timeout=10)
+        r = requests.post(url, headers=HEADERS, json=data, timeout=20)  # Increased timeout
         r.raise_for_status()
         return r.json()
     except requests.exceptions.RequestException as e:
         logging.error(f"POST request error: {e}")
         return {}
  
-def shopify_put(url, data):
-    """Perform a PUT request to Shopify API."""
-    try:
-        r = requests.put(url, headers=HEADERS, json=data, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"PUT request error: {e}")
-        return {}
+def shopify_put(url, data, retries=3):
+    """Perform a PUT request to Shopify API with retry logic."""
+    for attempt in range(retries):
+        try:
+            r = requests.put(url, headers=HEADERS, json=data, timeout=20)  # Increased timeout
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"PUT request attempt {attempt + 1} failed: {e}")
+            if attempt == retries - 1:
+                return {}
+            time.sleep(2)  # Wait before retrying
  
 # -----------------------------
 # PRICE LOGIC
@@ -352,7 +355,6 @@ def sync_product(p, counters, resync_quantity_counter):
  
     if existing:
         needs_update = False
-        meaningful_change = False
  
         # Get existing values
         existing_price = existing['variants'][0]['price']
@@ -364,30 +366,21 @@ def sync_product(p, counters, resync_quantity_counter):
         new_inventory_quantity = product_payload['variants'][0]['inventory_quantity']
         new_status = product_payload['status']
  
-        # Check for price change
-        if existing_price != new_price:
+        # Check for price change (with rounding)
+        if round(float(existing_price), 2) != round(float(new_price), 2):
             needs_update = True
-            meaningful_change = True
             logging.info(f"Price changed: {existing_price} -> {new_price}")
  
         # Check for inventory change
         if existing_inventory_quantity != new_inventory_quantity:
-            if existing_status == "draft" and new_inventory_quantity >= 1:
-                product_payload['status'] = "active"
-                product_payload['published'] = True
-                needs_update = True
-                meaningful_change = True
-                logging.info("Status changed from draft to active due to inventory change.")
-            elif existing_status == "active" and new_inventory_quantity == 0:
-                product_payload['status'] = "draft"
-                product_payload['published'] = False
-                needs_update = True
-                meaningful_change = True
-                logging.info("Status changed from active to draft due to inventory change.")
- 
+            needs_update = True
             logging.info(f"Inventory changed: {existing_inventory_quantity} -> {new_inventory_quantity}")
  
-        # Log updates only if there's a meaningful change
+        # Check for status change
+        if existing_status != new_status:
+            needs_update = True
+            logging.info(f"Status changed: {existing_status} -> {new_status}")
+ 
         if needs_update:
             logging.info("🔄 Update needed")
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
