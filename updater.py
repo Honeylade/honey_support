@@ -376,6 +376,7 @@ def sync_product(p, counters, resync_quantity_counter):
             product_payload['published'] = False
  
         if needs_update:
+            print("🔄 Update needed")
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
             response = shopify_put(url, {"product": product_payload})
  
@@ -386,6 +387,7 @@ def sync_product(p, counters, resync_quantity_counter):
             else:
                 print(f"❌ Failed to update: {product_payload['title']}")
         else:
+            print("✅ No update needed")
             print(f"✅ No changes for: {product_payload['title']} (ID: {existing['id']})")
     else:
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
