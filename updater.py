@@ -77,36 +77,55 @@ def get_access_token():
 # API CALLS
 # -----------------------------
 def shopify_get(url, params=None):
-    """Perform a GET request to Shopify API."""
-    try:
-        r = requests.get(url, headers=HEADERS, params=params, timeout=20)  # Increased timeout
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"GET request error: {e}")
-        return {}
+    """Perform a GET request to Shopify API with rate limiting."""
+    for attempt in range(5):  # Retry up to 5 times
+        try:
+            r = requests.get(url, headers=HEADERS, params=params, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.HTTPError as e:
+            if r.status_code == 429:  # Too many requests
+                wait_time = int(r.headers.get("Retry-After", 1))  # Use Retry-After header if present
+                logging.warning(f"Rate limit hit. Waiting for {wait_time} seconds.")
+                time.sleep(wait_time)
+            else:
+                logging.error(f"GET request error: {e}")
+                return {}
+    return {}
  
 def shopify_post(url, data):
-    """Perform a POST request to Shopify API."""
-    try:
-        r = requests.post(url, headers=HEADERS, json=data, timeout=20)  # Increased timeout
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"POST request error: {e}")
-        return {}
+    """Perform a POST request to Shopify API with retry logic."""
+    for attempt in range(5):  # Retry up to 5 times
+        try:
+            r = requests.post(url, headers=HEADERS, json=data, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.HTTPError as e:
+            if r.status_code == 429:  # Too many requests
+                wait_time = int(r.headers.get("Retry-After", 1))  # Use Retry-After header if present
+                logging.warning(f"Rate limit hit. Waiting for {wait_time} seconds.")
+                time.sleep(wait_time)
+            else:
+                logging.error(f"POST request error: {e}")
+                return {}
+    return {}
  
 def shopify_put(url, data, retries=3):
     """Perform a PUT request to Shopify API with retry logic."""
     for attempt in range(retries):
         try:
-            r = requests.put(url, headers=HEADERS, json=data, timeout=20)  # Increased timeout
+            r = requests.put(url, headers=HEADERS, json=data, timeout=20)
             r.raise_for_status()
             return r.json()
-        except requests.exceptions.RequestException as e:
-            logging.error(f"PUT request attempt {attempt + 1} failed: {e}")
-            if attempt == retries - 1:
-                return {}
+        except requests.exceptions.HTTPError as e:
+            if r.status_code == 429:  # Too many requests
+                wait_time = int(r.headers.get("Retry-After", 1))  # Use Retry-After header if present
+                logging.warning(f"Rate limit hit. Waiting for {wait_time} seconds.")
+                time.sleep(wait_time)
+            else:
+                logging.error(f"PUT request attempt {attempt + 1} failed: {e}")
+                if attempt == retries - 1:
+                    return {}
             time.sleep(2)  # Wait before retrying
  
 # -----------------------------
@@ -118,7 +137,6 @@ def calc_price(cost, weight):
     weight = float(weight or 0)
  
     shipping = 3.99 if weight < 300 else 4.99 if weight < 2000 else 18
- 
     margin = 0.30 if cost < 5 else 0.25 if cost < 10 else 0.20
  
     TAX = 0.20
