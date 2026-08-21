@@ -345,7 +345,8 @@ def sync_product(p, counters, resync_quantity_counter):
         # Check if we need to update the product
         needs_update = (
             existing['variants'][0]['price'] != product_payload['variants'][0]['price'] or
-            existing['variants'][0]['inventory_quantity'] != product_payload['variants'][0]['inventory_quantity']
+            existing['variants'][0]['inventory_quantity'] != product_payload['variants'][0]['inventory_quantity'] or
+            existing['status'] != product_payload['status']  # Check for status change
         )
  
         # Check if the product is currently in draft and should be made active
@@ -358,15 +359,14 @@ def sync_product(p, counters, resync_quantity_counter):
             product_payload['status'] = "draft"
             product_payload['published'] = False
  
-        if needs_update or existing['status'] in ["draft", "active"]:
+        if needs_update:
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
             response = shopify_put(url, {"product": product_payload})
  
             if response:
                 print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
                 counters['updated'] += 1
-                if needs_update:
-                    resync_quantity_counter += product_payload['variants'][0]['inventory_quantity']
+                resync_quantity_counter += product_payload['variants'][0]['inventory_quantity']
             else:
                 print(f"❌ Failed to update: {product_payload['title']}")
         else:
@@ -380,7 +380,7 @@ def sync_product(p, counters, resync_quantity_counter):
             counters['created'] += 1
         else:
             print(f"❌ Failed to create: {product_payload['title']}")
- 
+         
 # -----------------------------
 # CHECK FOR STOCK CHANGES
 # -----------------------------
