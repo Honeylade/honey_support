@@ -337,44 +337,46 @@ def sync_product(p, counters, resync_quantity_counter):
     handle = product_payload.get("handle")
     sku = p.get("sku")
     barcode = p.get("barcode")
-    title = product_payload.get("title")
  
     existing = find_product_by_handle(handle) or find_product_by_sku_or_barcode(sku=sku, barcode=barcode)
  
     if existing:
-        # Determine if a meaningful update is needed
+        # Initialize needs_update flag
         needs_update = False
  
-        # Check if price or inventory quantity has changed
+        # Get existing values
         existing_price = existing['variants'][0]['price']
         existing_inventory_quantity = existing['variants'][0]['inventory_quantity']
         existing_status = existing['status']
  
+        # New values
         new_price = product_payload['variants'][0]['price']
         new_inventory_quantity = product_payload['variants'][0]['inventory_quantity']
         new_status = product_payload['status']
  
-        # Only set needs_update to True if there are actual changes
+        # Check for changes
         if existing_price != new_price:
             needs_update = True
             print(f"Price changed: {existing_price} -> {new_price}")
+ 
+        # Check if inventory change is significant
         if existing_inventory_quantity != new_inventory_quantity:
-            needs_update = True
+            # Status change logic based on inventory
+            if existing_status == "draft" and new_inventory_quantity >= 1:
+                product_payload['status'] = "active"
+                product_payload['published'] = True
+                needs_update = True
+                print(f"Status changed from draft to active due to inventory change.")
+ 
+            elif existing_status == "active" and new_inventory_quantity == 0:
+                product_payload['status'] = "draft"
+                product_payload['published'] = False
+                needs_update = True
+                print(f"Status changed from active to draft due to inventory change.")
+ 
             print(f"Inventory changed: {existing_inventory_quantity} -> {new_inventory_quantity}")
-        if existing_status != new_status:
-            needs_update = True
-            print(f"Status changed: {existing_status} -> {new_status}")
  
-        # Check if the product is currently in draft and should be made active
-        if existing['status'] == "draft" and new_inventory_quantity >= 1:
-            product_payload['status'] = "active"
-            product_payload['published'] = True
- 
-        # Check if the product is currently active and should be made draft
-        elif existing['status'] == "active" and new_inventory_quantity == 0:
-            product_payload['status'] = "draft"
-            product_payload['published'] = False
- 
+        # Only log update if needed
         if needs_update:
             print("🔄 Update needed")
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
@@ -390,6 +392,7 @@ def sync_product(p, counters, resync_quantity_counter):
             print("✅ No update needed")
             print(f"✅ No changes for: {product_payload['title']} (ID: {existing['id']})")
     else:
+        # Handle creation of new products
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
         response = shopify_post(url, {"product": product_payload})
  
