@@ -360,6 +360,10 @@ def sync_product(p, counters, resync_quantity_counter):
             needs_update = True
         if existing_status != new_status:
             needs_update = True
+         # Log comparison results for debugging
+        print(f"Price changed: {existing_price} -> {new_price}")
+        print(f"Inventory changed: {existing_inventory_quantity} -> {new_inventory_quantity}")
+        print(f"Status changed: {existing_status} -> {new_status}")
  
         # Check if the product is currently in draft and should be made active
         if existing['status'] == "draft" and new_inventory_quantity >= 1:
