@@ -358,7 +358,7 @@ def sync_product(p, counters, resync_quantity_counter):
         if existing_price != new_price:
             needs_update = True
             meaningful_change = True
-            print(f"Price changed: {existing_price} -> {new_price}")
+           # print(f"Price changed: {existing_price} -> {new_price}")
  
         # Check for inventory change
         if existing_inventory_quantity != new_inventory_quantity:
@@ -367,19 +367,19 @@ def sync_product(p, counters, resync_quantity_counter):
                 product_payload['published'] = True
                 needs_update = True
                 meaningful_change = True
-                print("Status changed from draft to active due to inventory change.")
+               # print("Status changed from draft to active due to inventory change.")
             elif existing_status == "active" and new_inventory_quantity == 0:
                 product_payload['status'] = "draft"
                 product_payload['published'] = False
                 needs_update = True
                 meaningful_change = True
-                print("Status changed from active to draft due to inventory change.")
+                # print("Status changed from active to draft due to inventory change.")
  
-            print(f"Inventory changed: {existing_inventory_quantity} -> {new_inventory_quantity}")
+           # print(f"Inventory changed: {existing_inventory_quantity} -> {new_inventory_quantity}")
  
         # Log updates only if there's a meaningful change
         if needs_update:
-            print("🔄 Update needed")
+           # print("🔄 Update needed")
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
             response = shopify_put(url, {"product": product_payload})
  
