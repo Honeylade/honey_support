@@ -332,7 +332,7 @@ def load_xml():
 # -----------------------------
 # SYNC PRODUCT
 # -----------------------------
-def sync_product(p, counters):
+def sync_product(p, counters, resync_quantity_counter):
     product_payload = build_product(p)
     handle = product_payload.get("handle")
     sku = p.get("sku")
@@ -351,12 +351,12 @@ def sync_product(p, counters):
         # Check if the product is currently in draft and should be made active
         if existing['status'] == "draft" and product_payload['variants'][0]['inventory_quantity'] >= 1:
             product_payload['status'] = "active"
-            product_payload['published'] = True  # Ensure it's published as well
+            product_payload['published'] = True
  
         # Check if the product is currently active and should be made draft
         elif existing['status'] == "active" and product_payload['variants'][0]['inventory_quantity'] == 0:
             product_payload['status'] = "draft"
-            product_payload['published'] = False  # Ensure it's unpublished
+            product_payload['published'] = False
  
         if needs_update or existing['status'] in ["draft", "active"]:
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
@@ -365,6 +365,8 @@ def sync_product(p, counters):
             if response:
                 print(f"🔄 Updated: {product_payload['title']} (ID: {existing['id']})")
                 counters['updated'] += 1
+                if needs_update:
+                    resync_quantity_counter += product_payload['variants'][0]['inventory_quantity']
             else:
                 print(f"❌ Failed to update: {product_payload['title']}")
         else:
@@ -382,14 +384,16 @@ def sync_product(p, counters):
 # -----------------------------
 # CHECK FOR STOCK CHANGES
 # -----------------------------
-def check_for_changes(counters):
+def check_for_changes(counters, resync_quantity_counter):
     while True:
         time.sleep(900)  # Check every 15 minutes
         # Logic to check for stock changes
         # This is a placeholder; you would need to implement the actual API call to get updated products.
         updated_products = []  # Assume this is filled with updated products
         for product in updated_products:
-            sync_product(product, counters)  # Re-sync the updated product
+            sync_product(product, counters, resync_quantity_counter)  # Re-sync the updated product
+            # Log the total quantity resynced
+            print(f"Total Quantity Resynced: {resync_quantity_counter}")
  
 # -----------------------------
 # RUN SYNC
@@ -403,14 +407,15 @@ def run_sync():
  
     items = load_xml()
     counters = {'updated': 0, 'created': 0}
+    resync_quantity_counter = 0  # Initialize resync quantity counter
  
     # Start the background thread for checking stock changes
-    change_checker_thread = threading.Thread(target=check_for_changes, args=(counters,))
+    change_checker_thread = threading.Thread(target=check_for_changes, args=(counters, resync_quantity_counter))
     change_checker_thread.daemon = True
     change_checker_thread.start()
  
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {executor.submit(sync_product, p, counters): p for p in items}
+        futures = {executor.submit(sync_product, p, counters, resync_quantity_counter): p for p in items}
  
         for future in as_completed(futures):
             p = futures[future]
@@ -419,7 +424,7 @@ def run_sync():
             except Exception as e:
                 print(f"❌ Error syncing product {p.get('title')}: {e}")
  
-    print(f"✅ DONE: Total Updated: {counters['updated']}, Total Created: {counters['created']}")
+    print(f"✅ DONE: Total Updated: {counters['updated']}, Total Created: {counters['created']}, Total Quantity Resynced: {resync_quantity_counter}")
  
 # -----------------------------
 # RUN
