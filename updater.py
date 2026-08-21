@@ -387,20 +387,17 @@ def sync_product(p, counters, resync_quantity_counter):
         # Check for price change (with rounding)
         if round(float(existing_price), 2) != round(float(new_price), 2):
             needs_update = True
-            logging.info(f"Price changed: {existing_price} -> {new_price}")
- 
+            
         # Check for inventory change
         if existing_inventory_quantity != new_inventory_quantity:
             needs_update = True
-            logging.info(f"Inventory changed: {existing_inventory_quantity} -> {new_inventory_quantity}")
  
         # Check for status change
         if existing_status != new_status:
             needs_update = True
-            logging.info(f"Status changed: {existing_status} -> {new_status}")
- 
+       
         if needs_update:
-            logging.info("🔄 Update needed")
+            # logging.info("🔄 Update needed")
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
             response = shopify_put(url, {"product": product_payload})
  
@@ -411,7 +408,7 @@ def sync_product(p, counters, resync_quantity_counter):
             else:
                 logging.error(f"❌ Failed to update: {product_payload['title']}")
         else:
-            logging.info("✅ No updates needed for: " + product_payload['title'])
+            counters['no_updates_needed'] += 1  # Increment the counter for no updates
     else:
         # Handle creation of new products
         url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
@@ -450,7 +447,7 @@ def run_sync():
     HEADERS["X-Shopify-Access-Token"] = token  # Update headers with the new token
  
     items = load_xml()
-    counters = {'updated': 0, 'created': 0}
+    counters = {'updated': 0, 'created': 0, 'no_updates_needed': 0}  # Add new counter
     resync_quantity_counter = 0  # Initialize resync quantity counter
  
     # Start the background thread for checking stock changes
@@ -468,7 +465,7 @@ def run_sync():
             except Exception as e:
                 logging.error(f"❌ Error syncing product {p.get('title')}: {e}")
  
-    logging.info(f"✅ DONE: Total Updated: {counters['updated']}, Total Created: {counters['created']}, Total Quantity Resynced: {resync_quantity_counter}")
+    logging.info(f"✅ DONE: Total Updated: {counters['updated']}, Total Created: {counters['created']}, Total No Updates Needed: {counters['no_updates_needed']}, Total Quantity Resynced: {resync_quantity_counter}")
  
 # -----------------------------
 # RUN
