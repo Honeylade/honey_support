@@ -435,7 +435,7 @@ def run_sync():
     change_checker_thread.daemon = True
     change_checker_thread.start()
  
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=1) as executor:
         futures = {executor.submit(sync_product, p, counters, resync_quantity_counter): p for p in items}
  
         for future in as_completed(futures):
