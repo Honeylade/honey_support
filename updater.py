@@ -408,14 +408,15 @@ def sync_product(p, counters, resync_quantity_counter):
 def check_for_changes(counters, resync_quantity_counter):
     while True:
         time.sleep(900)  # Check every 15 minutes
-        # Logic to check for stock changes
-        # This is a placeholder; you would need to implement the actual API call to get updated products.
-        updated_products = []  # Assume this is filled with updated products
-        for product in updated_products:
-            sync_product(product, counters, resync_quantity_counter)  # Re-sync the updated product
-            # Log the total quantity resynced
-            print(f"Total Quantity Resynced: {resync_quantity_counter}")
- 
+        try:
+            updated_products = get_updated_products()  # Fetch updated products from the API
+            print(f"Checked for changes at {time.ctime()}. Found {len(updated_products)} products to sync.")
+            for product in updated_products:
+                sync_product(product, counters, resync_quantity_counter)  # Re-sync the updated product
+                print(f"Total Quantity Resynced: {resync_quantity_counter}")
+        except Exception as e:
+            print(f"Error fetching updated products: {e}")
+             
 # -----------------------------
 # RUN SYNC
 # -----------------------------
