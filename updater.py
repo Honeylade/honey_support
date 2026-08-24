@@ -6,6 +6,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import threading
+import datetime  # Import datetime for timestamp handling
  
 # -----------------------------
 # CONFIG
@@ -332,10 +333,12 @@ def load_xml():
 # -----------------------------
 # GET UPDATED PRODUCTS
 # -----------------------------
-def get_updated_products():
+def get_updated_products(last_sync_time):
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
     try:
-        res = shopify_get(url, params={"updated_at_min": "YYYY-MM-DDTHH:MM:SSZ"})  # Adjust as needed
+        print(f"Fetching products updated since: {last_sync_time.isoformat()}")
+        res = shopify_get(url, params={"updated_at_min": last_sync_time.isoformat()})
+        print(f"Response: {res}")
         return res.get("products", [])
     except Exception as e:
         print(f"Error fetching updated products: {e}")
@@ -408,18 +411,18 @@ def sync_product(p, counters, resync_quantity_counter):
 # -----------------------------
 # CHECK FOR STOCK CHANGES
 # -----------------------------
-def check_for_changes(counters, resync_quantity_counter):
+def check_for_changes(counters, resync_quantity_counter, last_sync_time):
     while True:
         time.sleep(900)  # Check every 15 minutes
         try:
-            updated_products = get_updated_products()  # Fetch updated products from the API
+            updated_products = get_updated_products(last_sync_time)  # Pass last sync time
             print(f"Checked for changes at {time.ctime()}. Found {len(updated_products)} products to sync.")
             for product in updated_products:
                 sync_product(product, counters, resync_quantity_counter)  # Re-sync the updated product
-                print(f"Total Quantity Resynced: {resync_quantity_counter}")
+            last_sync_time = datetime.datetime.now()  # Update last sync time
         except Exception as e:
             print(f"Error fetching updated products: {e}")
-             
+ 
 # -----------------------------
 # RUN SYNC
 # -----------------------------
@@ -433,9 +436,10 @@ def run_sync():
     items = load_xml()
     counters = {'updated': 0, 'created': 0}
     resync_quantity_counter = 0  # Initialize resync quantity counter
+    last_sync_time = datetime.datetime.now()  # Initialize last sync time
  
     # Start the background thread for checking stock changes
-    change_checker_thread = threading.Thread(target=check_for_changes, args=(counters, resync_quantity_counter))
+    change_checker_thread = threading.Thread(target=check_for_changes, args=(counters, resync_quantity_counter, last_sync_time))
     change_checker_thread.daemon = True
     change_checker_thread.start()
  
