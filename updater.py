@@ -371,6 +371,16 @@ def sync_product(p, counters, resync_quantity_counter):
             needs_update = True
             meaningful_change = True
         
+        # Check for inventory quantity change
+        if existing_inventory_quantity != new_inventory_quantity:
+            needs_update = True
+            meaningful_change = True
+            
+        # Check for status change
+        if existing_status != new_status:
+            needs_update = True
+            meaningful_change = True
+            
         # Log updates only if there's a meaningful change
         if needs_update:
             url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products/{existing['id']}.json"
