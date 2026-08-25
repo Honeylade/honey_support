@@ -330,19 +330,31 @@ def load_xml():
         products.append(data)
  
     return products
- 
+
 # -----------------------------
 # GET UPDATED PRODUCTS
 # -----------------------------
+last_checked_time = None  # Initialize a variable to store the last checked time
+ 
 def get_updated_products():
+    global last_checked_time
     url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/products.json"
+    
+    # If last_checked_time is not set, initialize it to the current time
+    if last_checked_time is None:
+        last_checked_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    
+    params = {"updated_at_min": last_checked_time}  # Use the last checked time
+    
     try:
-        res = shopify_get(url, params={"updated_at_min": "YYYY-MM-DDTHH:MM:SSZ"})  # Adjust as needed
+        res = shopify_get(url, params=params)
+        # Update last_checked_time to the current time after fetching
+        last_checked_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return res.get("products", [])
     except Exception as e:
         print(f"Error fetching updated products: {e}")
         return []
- 
+      
 # -----------------------------
 # SYNC PRODUCT
 # -----------------------------
