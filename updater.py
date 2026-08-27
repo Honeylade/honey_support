@@ -297,6 +297,7 @@ def build_product(p):
         "status": "active" if stock_qty >= 1 else "draft",
         "published": True if stock_qty >= 1 else False,
         "variants": variants,
+        "inventory_quantity": stock_qty,  # Include stock quantity at product level
         **({"images": images} if images else {})
     }
  
