@@ -2,86 +2,82 @@ import os
 import re
 import html
 import time
-import uuid
 import requests
 import xml.etree.ElementTree as ET
-from typing import Optional, Dict, List, Any
+ 
+from typing import Optional, Dict, List, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
  
 # ============================================================
 # CONFIGURATION
 # ============================================================
  
-SHOP_URL = os.getenv("SHOP_URL")
-XML_URL = os.getenv("XML_URL")
+SHOP_URL = (os.getenv("SHOP_URL") or "").strip().replace("https://", "").rstrip("/")
+XML_URL = (os.getenv("XML_URL") or "").strip()
+API_VERSION = os.getenv("API_VERSION", "2024-01").strip()
  
-# Current Shopify Admin GraphQL API version
-API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
+# Number of products to process.
+# Empty / None / 0 = ALL
+LIMIT_RAW = os.getenv("LIMIT", "").strip()
  
-# ------------------------------------------------------------
-# IMPORTANT:
-# Set this to the Shopify Location ID where supplier stock
-# should be written.
-# Example: LOCATION_ID=gid://shopify/Location/123456789
-# If left empty and there is exactly one active Shopify
-# location, the script will automatically use it.
-# ------------------------------------------------------------
-LOCATION_ID = os.getenv("LOCATION_ID")
- 
-# ------------------------------------------------------------
-# Number of simultaneous products.
-# For approximately 5,000 products: 5 is a safe starting point.
-# If Shopify throttles heavily, reduce to 3.
-# ------------------------------------------------------------
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
- 
-# ------------------------------------------------------------
-# Product limit
-# LIMIT=10      -> test first 10 products
-# LIMIT=100     -> test first 100
-# LIMIT=0       -> all
-# LIMIT=None    -> all
-# ------------------------------------------------------------
-LIMIT_RAW = os.getenv("LIMIT", "0")
-if LIMIT_RAW.lower() in ("none", "", "0"):
+if not LIMIT_RAW or LIMIT_RAW.lower() in ("none", "0", "all"):
     LIMIT = None
 else:
-    LIMIT = int(LIMIT_RAW)
+    try:
+        LIMIT = int(LIMIT_RAW)
+    except ValueError:
+        raise RuntimeError("LIMIT must be a number, 0, None, or all.")
  
+# Worker count.
+# 5 is a sensible starting point for ~5,000 products.
+try:
+    WORKERS = int(os.getenv("WORKERS", "5"))
+except ValueError:
+    WORKERS = 5
+ 
+WORKERS = max(1, min(WORKERS, 10))
+ 
+# Shopify location.
+# Can be:
+# numeric ID: 123456789
+# GID: gid://shopify/Location/123456789
+LOCATION_ID = (os.getenv("LOCATION_ID") or "").strip()
+ 
+# Retry configuration.
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_DELAY = float(os.getenv("RETRY_DELAY", "2"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "4"))
-RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "2"))
  
-# ------------------------------------------------------------
-# CREATE PRODUCTS
-# TRUE  = create missing supplier products
-# FALSE = don't create missing products
-# ------------------------------------------------------------
-CREATE_MISSING_PRODUCTS = os.getenv("CREATE_MISSING_PRODUCTS", "true").lower() == "true"
+# Whether to update product images.
+UPDATE_IMAGES = os.getenv("UPDATE_IMAGES", "false").lower() == "true"
  
-# ------------------------------------------------------------
-# UPDATE PRODUCT DESCRIPTION / TAGS ETC.
-# ------------------------------------------------------------
+# Whether to update descriptions, vendor, type and tags.
 UPDATE_PRODUCT_DATA = os.getenv("UPDATE_PRODUCT_DATA", "true").lower() == "true"
  
-# ------------------------------------------------------------
-# UPDATE PRICES
-# ------------------------------------------------------------
-UPDATE_PRICES = os.getenv("UPDATE_PRICES", "true").lower() == "true"
+# ============================================================
+# REQUIRED ENVIRONMENT VARIABLES
+# ============================================================
  
-# ------------------------------------------------------------
-# UPDATE SKU / COST / WEIGHT
-# ------------------------------------------------------------
-UPDATE_INVENTORY_ITEM = os.getenv("UPDATE_INVENTORY_ITEM", "true").lower() == "true"
+if not SHOP_URL:
+    raise RuntimeError("SHOP_URL is not configured.")
  
-# ------------------------------------------------------------
-# UPDATE STOCK
-# ------------------------------------------------------------
-UPDATE_INVENTORY = os.getenv("UPDATE_INVENTORY", "true").lower() == "true"
+if not XML_URL:
+    raise RuntimeError("XML_URL is not configured.")
  
-# ------------------------------------------------------------
-# PRODUCT TAGS
-# ------------------------------------------------------------
+CLIENT_ID = (os.getenv("CLIENT_ID") or "").strip()
+CLIENT_SECRET = (os.getenv("CLIENT_SECRET") or "").strip()
+ 
+if not CLIENT_ID:
+    raise RuntimeError("CLIENT_ID is not configured.")
+ 
+if not CLIENT_SECRET:
+    raise RuntimeError("CLIENT_SECRET is not configured.")
+ 
+# ============================================================
+# TAGS
+# ============================================================
+ 
 TAGS_TO_INCLUDE = [
     "football accessories",
     "football",
@@ -97,41 +93,83 @@ TAGS_TO_INCLUDE = [
 ]
  
 # ============================================================
-# VALIDATION
+# HTTP SESSION
 # ============================================================
  
-def validate_config():
-    missing = []
-    if not SHOP_URL:
-        missing.append("SHOP_URL")
-    if not XML_URL:
-        missing.append("XML_URL")
-    if missing:
+SESSION = requests.Session()
+adapter = HTTPAdapter(
+    pool_connections=max(WORKERS * 2, 10),
+    pool_maxsize=max(WORKERS * 2, 10),
+)
+ 
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
+ 
+BASE_URL = f"https://{SHOP_URL}/admin/api/{API_VERSION}"
+ 
+# ============================================================
+# ACCESS TOKEN MANAGEMENT
+# ============================================================
+ 
+_token_cache = {
+    "access_token": None,
+    "expires_at": 0,
+}
+ 
+def get_access_token() -> str:
+    """
+    Obtain Shopify client-credentials access token.
+    The token is cached until shortly before expiry.
+    """
+    if (_token_cache["access_token"] and time.time() < _token_cache["expires_at"] - 60):
+        return _token_cache["access_token"]
+ 
+    url = f"https://{SHOP_URL}/admin/oauth/access_token"
+    payload = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "client_credentials",
+    }
+ 
+    response = SESSION.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+ 
+    if response.status_code >= 400:
         raise RuntimeError(
-            "Missing required environment variables: "
-            + ", ".join(missing)
+            f"Shopify access-token request failed "
+            f"({response.status_code}): {response.text[:1000]}"
         )
  
-    if not SHOP_URL.startswith("http"):
-        # Accept: mystore.myshopify.com but remove accidental protocol.
-        global SHOP_URL
-        SHOP_URL = SHOP_URL.replace("https://", "").replace("http://", "")
-        SHOP_URL = SHOP_URL.rstrip("/")
+    data = response.json()
+    token = data.get("access_token")
+ 
+    if not token:
+        raise RuntimeError(
+            f"Shopify did not return an access token: {data}"
+        )
+ 
+    expires_in = int(data.get("expires_in", 86400))
+    _token_cache["access_token"] = token
+    _token_cache["expires_at"] = time.time() + expires_in
+ 
+    return token
  
 # ============================================================
 # PRICE LOGIC
 # ============================================================
  
 def calc_price(cost, weight):
-    cost = to_float(cost)
-    weight = to_float(weight)
+    cost = float(cost or 0)
+    weight = float(weight or 0)
  
-    shipping = (
-        3.99 if weight < 300
-        else 4.99 if weight < 2000
-        else 18.00
-    )
+    # Shipping
+    if weight < 300:
+        shipping = 3.99
+    elif weight < 2000:
+        shipping = 4.99
+    else:
+        shipping = 18.00
  
+    # Profit margin
     if cost < 5:
         margin = 0.30
     elif cost < 10:
@@ -155,7 +193,9 @@ def calc_price(cost, weight):
 # ============================================================
  
 def clean_text(value) -> str:
-    return html.unescape(str(value).strip()) if value else ""
+    if value is None:
+        return ""
+    return html.unescape(str(value).strip())
  
 def last_value(value) -> str:
     value = clean_text(value)
@@ -166,47 +206,32 @@ def split_tags(value) -> List[str]:
     return [t.strip() for t in re.split(r"[>\|,;/\s]+", value) if t.strip()]
  
 def sanitize_tags(tags: List[str]) -> List[str]:
-    result = []
+    sanitized = []
     seen = set()
  
     for tag in tags:
         if not tag:
             continue
+ 
         tag = html.unescape(str(tag)).replace("&", "and").strip()
-        if tag and len(tag) <= 255 and tag.lower() not in seen:
-            seen.add(tag.lower())
-            result.append(tag)
  
-    return result
+        if not tag:
+            continue
  
-def build_description(product: Dict[str, Any]) -> str:
-    bullets = []
-    for i in range(1, 11):
-        value = clean_text(product.get(f"desc_{i}"))
-        if value:
-            bullets.append(f"<li>{value}</li>")
+        if len(tag) > 255:
+            tag = tag[:255]
  
-    bullet_html = "<ul>" + "".join(bullets) + "</ul>" if bullets else ""
-    standard = clean_text(product.get("desc_standard"))
-    paragraph = f"<p>{standard}</p>" if standard else ""
+        key = tag.lower()
  
-    return bullet_html + paragraph
+        if key not in seen:
+            seen.add(key)
+            sanitized.append(tag)
+ 
+    return sanitized
  
 def slugify(value: str) -> str:
     value = clean_text(value)
-    value = value.lower()
-    return re.sub(r"[^a-z0-9]+", "-", value).strip("-")
- 
-def valid_image(url: str) -> bool:
-    if not url:
-        return False
- 
-    url = url.strip()
-    return (
-        url.startswith("http://") or url.startswith("https://") and
-        " " not in url and
-        any(ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"])
-    )
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
  
 def to_int(value, default=0) -> int:
     try:
@@ -220,17 +245,54 @@ def to_float(value, default=0.0) -> float:
     except (ValueError, TypeError):
         return default
  
+def valid_image(url: str) -> bool:
+    if not url:
+        return False
+ 
+    url = url.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False
+ 
+    if " " in url:
+        return False
+ 
+    extensions = [".jpg", ".jpeg", ".png", ".webp"]
+    return any(ext in url.lower() for ext in extensions)
+ 
+def build_description(product: Dict[str, Any]) -> str:
+    bullets = []
+ 
+    for i in range(1, 11):
+        value = clean_text(product.get(f"desc_{i}"))
+        if value:
+            bullets.append(f"<li>{value}</li>")
+ 
+    bullet_html = ""
+    if bullets:
+        bullet_html = "<ul>" + "".join(bullets) + "</ul>"
+ 
+    standard = clean_text(product.get("desc_standard"))
+    paragraph = f"<p>{standard}</p>"
+ 
+    return bullet_html + paragraph
+ 
+def normalize_gid(value: str, resource: str) -> str:
+    value = str(value).strip()
+    if value.startswith("gid://"):
+        return value
+    return f"gid://shopify/{resource}/{value}"
+ 
 # ============================================================
 # XML
 # ============================================================
  
 def load_xml() -> List[Dict[str, Any]]:
     print("📥 Downloading XML feed...")
-    response = requests.get(XML_URL, timeout=REQUEST_TIMEOUT)
+    response = SESSION.get(XML_URL, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     root = ET.fromstring(response.content)
     items = root.findall(".//post")
-    print(f"🔎 Found {len(items)} supplier items")
+    print(f"🔎 Found {len(items)} supplier products")
  
     if LIMIT is not None:
         items = items[:LIMIT]
@@ -242,19 +304,14 @@ def load_xml() -> List[Dict[str, Any]]:
             data[child.tag.lower()] = clean_text(child.text)
         products.append(data)
  
-    print(f"📦 Products selected for sync: {len(products)}")
     return products
  
 # ============================================================
-# SHOPIFY GRAPHQL
+# GRAPHQL
 # ============================================================
  
-def graphql_request(query: str, variables: Optional[Dict[str, Any]] = None, operation_name: str = "") -> Dict[str, Any]:
-    token = os.getenv("SHOPIFY_ACCESS_TOKEN")
-    if not token:
-        raise RuntimeError("SHOPIFY_ACCESS_TOKEN is not configured.")
- 
-    url = f"https://{SHOP_URL}/admin/api/{API_VERSION}/graphql.json"
+def graphql(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    token = get_access_token()
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -265,88 +322,64 @@ def graphql_request(query: str, variables: Optional[Dict[str, Any]] = None, oper
         "query": query,
         "variables": variables or {},
     }
-    if operation_name:
-        payload["operationName"] = operation_name
  
-    last_exception = None
+    last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+            response = SESSION.post(f"{BASE_URL}/graphql.json", headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
  
-            # ------------------------------------------------
-            # RATE LIMIT / TEMPORARY SHOPIFY FAILURE
-            # ------------------------------------------------
+            # Rate limiting / temporary Shopify errors
             if response.status_code in (429, 500, 502, 503, 504):
                 retry_after = response.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after else RETRY_BASE_DELAY * attempt
-                print(f"⚠️ Shopify HTTP {response.status_code}; waiting {delay:.1f}s (attempt {attempt}/{MAX_RETRIES})")
+                if retry_after:
+                    try:
+                        delay = float(retry_after)
+                    except ValueError:
+                        delay = RETRY_DELAY * attempt
+                else:
+                    delay = RETRY_DELAY * attempt
+ 
+                print(f"⚠️ Shopify HTTP {response.status_code}; retrying in {delay:.1f}s ({attempt}/{MAX_RETRIES})")
                 time.sleep(delay)
                 continue
  
             response.raise_for_status()
             result = response.json()
- 
-            # ------------------------------------------------
-            # GRAPHQL ERRORS
-            # ------------------------------------------------
             errors = result.get("errors")
+ 
             if errors:
                 error_text = str(errors)
-                permanent_markers = [
-                    "INVALID_VARIABLE", "variableMismatch", "Field is not defined",
-                    "Unknown argument", "Unknown field", "Cannot query field",
-                    "Type mismatch", "Parse error", "Syntax Error",
-                ]
-                is_permanent = any(marker in error_text for marker in permanent_markers)
-                if is_permanent:
-                    raise RuntimeError("Permanent Shopify GraphQL error: " + error_text)
+                # These are permanent schema/validation errors.
+                permanent_markers = (
+                    "INVALID_VARIABLE",
+                    "variableMismatch",
+                    "Field is not defined",
+                    "doesn't exist on type",
+                    "Type mismatch",
+                    "Unknown argument",
+                    "Unknown field",
+                )
  
-                last_exception = RuntimeError("GraphQL errors: " + error_text)
-                if attempt < MAX_RETRIES:
-                    delay = RETRY_BASE_DELAY * attempt
-                    print(f"⚠️ Shopify GraphQL error; retrying in {delay:.1f}s ({attempt}/{MAX_RETRIES})")
-                    time.sleep(delay)
-                    continue
+                if any(marker in error_text for marker in permanent_markers):
+                    raise RuntimeError("GraphQL validation error: " + error_text)
  
-                raise last_exception
+                raise RuntimeError("GraphQL errors: " + error_text)
  
-            return result.get("data", {})
- 
-        except requests.exceptions.RequestException as exc:
-            last_exception = exc
-            if attempt >= MAX_RETRIES:
-                break
-            delay = RETRY_BASE_DELAY * attempt
-            print(f"⚠️ Network error: {exc}; retrying in {delay:.1f}s ({attempt}/{MAX_RETRIES})")
-            time.sleep(delay)
+            return result.get("data") or {}
  
         except RuntimeError:
             raise
  
         except Exception as exc:
-            last_exception = exc
+            last_error = exc
             if attempt >= MAX_RETRIES:
                 break
-            delay = RETRY_BASE_DELAY * attempt
+ 
+            delay = RETRY_DELAY * attempt
+            print(f"⚠️ Shopify request failed: {exc}; retrying in {delay:.1f}s ({attempt}/{MAX_RETRIES})")
             time.sleep(delay)
  
-    raise RuntimeError("Shopify GraphQL request failed after " f"{MAX_RETRIES} attempts: " f"{last_exception}")
- 
-# ============================================================
-# SHOPIFY USER ERROR HANDLER
-# ============================================================
- 
-def raise_user_errors(user_errors, operation):
-    if not user_errors:
-        return
- 
-    formatted = []
-    for error in user_errors:
-        field = error.get("field")
-        message = error.get("message", "Unknown Shopify error")
-        formatted.append(f"{field}: {message}" if field else message)
- 
-    raise RuntimeError(f"{operation} failed: " + " | ".join(formatted))
+    raise RuntimeError(f"Shopify GraphQL request failed after {MAX_RETRIES} attempts: {last_error}")
  
 # ============================================================
 # SHOPIFY LOCATIONS
@@ -365,155 +398,64 @@ query GetLocations {
 }
 """
  
-def get_locations():
-    data = graphql_request(LOCATIONS_QUERY, operation_name="GetLocations")
-    return data["locations"]["nodes"]
+def get_locations() -> List[Dict[str, Any]]:
+    data = graphql(LOCATIONS_QUERY)
+    return data.get("locations", {}).get("nodes", [])
  
-def resolve_location_id():
+def resolve_location_id() -> str:
     locations = get_locations()
     active_locations = [location for location in locations if location.get("isActive")]
  
     if not active_locations:
         raise RuntimeError("❌ No active Shopify locations found.")
  
-    # --------------------------------------------------------
     # Explicit LOCATION_ID
-    # --------------------------------------------------------
     if LOCATION_ID:
-        for location in locations:
-            if location["id"] == LOCATION_ID:
+        wanted = LOCATION_ID
+        if not wanted.startswith("gid://"):
+            wanted = normalize_gid(wanted, "Location")
+ 
+        for location in active_locations:
+            if location["id"] == wanted:
                 print(f"📍 Inventory location: {location['name']} ({location['id']})")
                 return location["id"]
  
         print("\n📍 Shopify locations:")
-        for location in locations:
-            print(f"   {location['name']}: {location['id']} (active={location['isActive']})")
+        for location in active_locations:
+            print(f"   {location['name']}: {location['id']}")
         raise RuntimeError(f"❌ LOCATION_ID was not found: {LOCATION_ID}")
  
-    # --------------------------------------------------------
     # Automatically use only active location
-    # --------------------------------------------------------
     if len(active_locations) == 1:
         location = active_locations[0]
         print(f"📍 Automatically using Shopify location: {location['name']} ({location['id']})")
         return location["id"]
  
-    # --------------------------------------------------------
-    # Multiple locations
-    # --------------------------------------------------------
+    # Prefer location that fulfills online orders
+    online_locations = [location for location in active_locations if location.get("fulfillsOnlineOrders")]
+    if len(online_locations) == 1:
+        location = online_locations[0]
+        print(f"📍 Automatically using online fulfillment location: {location['name']} ({location['id']})")
+        return location["id"]
+ 
     print("\n📍 Shopify locations:")
-    for location in locations:
-        print(f"   {location['name']}: {location['id']} (active={location['isActive']}, online={location['fulfillsOnlineOrders']})")
+    for location in active_locations:
+        print(f"   {location['name']}: {location['id']} (online={location.get('fulfillsOnlineOrders')})")
  
-    raise RuntimeError("❌ Multiple active Shopify locations found. Set LOCATION_ID in your environment.")
- 
-# ============================================================
-# FIND PRODUCT
-# ============================================================
- 
-PRODUCT_BY_HANDLE_QUERY = """
-query ProductByHandle($query: String!) {
-    products(first: 1, query: $query) {
-        nodes {
-            id
-            title
-            handle
-            status
-            variants(first: 250) {
-                nodes {
-                    id
-                    title
-                    sku
-                    barcode
-                    inventoryItem {
-                        id
-                        sku
-                        tracked
-                        unitCost {
-                            amount
-                        }
-                        measurement {
-                            weight {
-                                value
-                                unit
-                            }
-                        }
-                    }
-                    selectedOptions {
-                        name
-                        value
-                    }
-                }
-            }
-        }
-    }
-}
-"""
- 
-def find_product_by_handle(handle: str) -> Optional[Dict[str, Any]]:
-    data = graphql_request(PRODUCT_BY_HANDLE_QUERY, {"query": f"handle:{handle}"}, operation_name="ProductByHandle")
-    products = data["products"]["nodes"]
-    return products[0] if products else None
+    raise RuntimeError("❌ Multiple Shopify locations found. Set LOCATION_ID.")
  
 # ============================================================
-# FIND VARIANT
+# SOURCE PRODUCT
 # ============================================================
  
-def find_matching_variant(product, source):
-    variants = product.get("variants", {}).get("nodes", [])
-    source_sku = clean_text(source.get("sku"))
-    source_barcode = clean_text(source.get("barcode"))
- 
-    # --------------------------------------------------------
-    # 1. Barcode match
-    # --------------------------------------------------------
-    if source_barcode:
-        for variant in variants:
-            if clean_text(variant.get("barcode")) == source_barcode:
-                return variant
- 
-    # --------------------------------------------------------
-    # 2. SKU match
-    # --------------------------------------------------------
-    if source_sku:
-        for variant in variants:
-            variant_sku = clean_text(variant.get("sku"))
-            inventory_sku = clean_text(variant.get("inventoryItem", {}).get("sku"))
-            if variant_sku == source_sku or inventory_sku == source_sku:
-                return variant
- 
-    # --------------------------------------------------------
-    # 3. If only one variant exists
-    # --------------------------------------------------------
-    if len(variants) == 1:
-        return variants[0]
- 
-    # --------------------------------------------------------
-    # 4. Try size option
-    # --------------------------------------------------------
-    sizes = source.get("sizes") or []
-    if sizes:
-        wanted = clean_text(sizes[0]).lower()
-        for variant in variants:
-            selected_options = variant.get("selectedOptions", [])
-            for option in selected_options:
-                if option.get("name", "").lower() == "size" and option.get("value", "").lower() == wanted:
-                    return variant
- 
-    return None
- 
-# ============================================================
-# BUILD SOURCE PRODUCT
-# ============================================================
- 
-def build_source_product(p: Dict[str, Any]):
+def build_source_product(p: Dict[str, Any]) -> Dict[str, Any]:
     title = clean_text(p.get("title")) or f"Product-{clean_text(p.get('sku'))}"
     handle = slugify(title)
     cost = to_float(p.get("costprice"))
     weight = to_float(p.get("weight"))
     stock = max(0, to_int(p.get("stock")))
-    sku = clean_text(p.get("sku")) or None
     barcode = clean_text(p.get("barcode")) or None
+    sku = clean_text(p.get("sku")) or None
     price = calc_price(cost, weight)
     vendor = last_value(p.get("productbrand"))
     product_type = last_value(p.get("productrange"))
@@ -536,8 +478,8 @@ def build_source_product(p: Dict[str, Any]):
         "cost": cost,
         "weight": weight,
         "stock": stock,
-        "sku": sku,
         "barcode": barcode,
+        "sku": sku,
         "price": price,
         "vendor": vendor,
         "product_type": product_type,
@@ -546,6 +488,91 @@ def build_source_product(p: Dict[str, Any]):
         "images": images,
         "sizes": sizes,
     }
+ 
+# ============================================================
+# FIND PRODUCT
+# ============================================================
+ 
+PRODUCT_QUERY = """
+query ProductByHandle($query: String!) {
+    products(first: 1, query: $query) {
+        nodes {
+            id
+            title
+            handle
+            status
+            variants(first: 250) {
+                nodes {
+                    id
+                    title
+                    sku
+                    barcode
+                    inventoryItem {
+                        id
+                        tracked
+                    }
+                }
+            }
+        }
+    }
+}
+"""
+ 
+def find_product_by_handle(handle: str) -> Optional[Dict[str, Any]]:
+    data = graphql(PRODUCT_QUERY, {"query": f"handle:{handle}"})
+    products = data.get("products", {}).get("nodes", [])
+    return products[0] if products else None
+ 
+def find_product_by_sku_or_barcode(sku: Optional[str], barcode: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not sku and not barcode:
+        return None
+ 
+    search_terms = []
+    if sku:
+        search_terms.append(f"sku:{sku}")
+    if barcode:
+        search_terms.append(f"barcode:{barcode}")
+ 
+    for query_text in search_terms:
+        query = """
+        query FindProduct($query: String!) {
+            products(first: 10, query: $query) {
+                nodes {
+                    id
+                    title
+                    handle
+                    status
+                    variants(first: 250) {
+                        nodes {
+                            id
+                            title
+                            sku
+                            barcode
+                            inventoryItem {
+                                id
+                                tracked
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+        data = graphql(query, {"query": query_text})
+        products = data.get("products", {}).get("nodes", [])
+ 
+        for product in products:
+            for variant in product.get("variants", {}).get("nodes", []):
+                variant_sku = str(variant.get("sku")) if variant.get("sku") else None
+                variant_barcode = str(variant.get("barcode")) if variant.get("barcode") else None
+ 
+                if sku and variant_sku == str(sku):
+                    return product
+ 
+                if barcode and variant_barcode == str(barcode):
+                    return product
+ 
+    return None
  
 # ============================================================
 # PRODUCT UPDATE
@@ -568,8 +595,7 @@ mutation ProductUpdate($input: ProductUpdateInput!) {
 }
 """
  
-def update_product_data(product_id, source):
-    status = "ACTIVE" if source["stock"] > 0 else "DRAFT"
+def update_product_data(product_id: str, source: Dict[str, Any]) -> None:
     input_data = {
         "id": product_id,
         "title": source["title"],
@@ -577,131 +603,28 @@ def update_product_data(product_id, source):
         "vendor": source["vendor"],
         "productType": source["product_type"],
         "tags": source["tags"],
-        "status": status,
     }
  
-    data = graphql_request(PRODUCT_UPDATE_MUTATION, {"input": input_data}, operation_name="ProductUpdate")
-    payload = data["productUpdate"]
-    raise_user_errors(payload.get("userErrors"), "Product update")
+    data = graphql(PRODUCT_UPDATE_MUTATION, {"input": input_data})
+    result = data.get("productUpdate", {})
+    errors = result.get("userErrors", [])
+ 
+    if errors:
+        raise RuntimeError("Shopify productUpdate errors: " + str(errors))
  
 # ============================================================
-# VARIANT BULK UPDATE
+# PRODUCT VARIANT UPDATE
 # ============================================================
  
-VARIANT_BULK_UPDATE_MUTATION = """
-mutation ProductVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-    productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-        product {
-            id
-        }
-        productVariants {
-            id
-            price
-            barcode
-        }
-        userErrors {
-            field
-            message
-        }
-    }
-}
-"""
- 
-def update_variant(product_id, variant, source):
-    variant_input = {"id": variant["id"]}
- 
-    if UPDATE_PRICES:
-        variant_input["price"] = str(source["price"])
- 
-    if source["barcode"]:
-        variant_input["barcode"] = source["barcode"]
- 
-    # --------------------------------------------------------
-    # Weight belongs inside inventoryItem.measurement
-    # --------------------------------------------------------
-    if source["weight"] > 0:
-        variant_input["inventoryItem"] = {
-            "measurement": {
-                "weight": {
-                    "value": source["weight"],
-                    "unit": "GRAMS",
-                }
-            }
-        }
- 
-    # Don't send an empty update.
-    if len(variant_input) == 1:
-        return
- 
-    data = graphql_request(VARIANT_BULK_UPDATE_MUTATION, {
-        "productId": product_id,
-        "variants": [variant_input],
-    }, operation_name="ProductVariantsBulkUpdate")
- 
-    payload = data["productVariantsBulkUpdate"]
-    raise_user_errors(payload.get("userErrors"), "Variant update")
- 
-# ============================================================
-# INVENTORY ITEM UPDATE
-# ============================================================
- 
-INVENTORY_ITEM_UPDATE_MUTATION = """
-mutation InventoryItemUpdate($id: ID!, $input: InventoryItemInput!) {
-    inventoryItemUpdate(id: $id, input: $input) {
-        inventoryItem {
+VARIANT_UPDATE_MUTATION = """
+mutation ProductVariantUpdate($input: ProductVariantInput!) {
+    productVariantUpdate(input: $input) {
+        productVariant {
             id
             sku
-            tracked
-            unitCost {
-                amount
-            }
-        }
-        userErrors {
-            field
-            message
-        }
-    }
-}
-"""
- 
-def update_inventory_item(variant, source):
-    inventory_item = variant.get("inventoryItem")
-    if not inventory_item:
-        raise RuntimeError("Variant has no inventoryItem.")
- 
-    inventory_item_id = inventory_item["id"]
-    input_data = {
-        "tracked": True,
-        "sku": source.get("sku"),
-        "cost": source["cost"],
-    }
- 
-    data = graphql_request(INVENTORY_ITEM_UPDATE_MUTATION, {
-        "id": inventory_item_id,
-        "input": input_data,
-    }, operation_name="InventoryItemUpdate")
- 
-    payload = data["inventoryItemUpdate"]
-    raise_user_errors(payload.get("userErrors"), "Inventory item update")
-    return inventory_item_id
- 
-# ============================================================
-# ACTIVATE INVENTORY AT LOCATION
-# ============================================================
- 
-ACTIVATE_INVENTORY_MUTATION = """
-mutation InventoryBulkToggleActivation($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!) {
-    inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, inventoryItemUpdates: $inventoryItemUpdates) {
-        inventoryItem {
-            id
-        }
-        inventoryLevels {
-            id
-            quantities(names: ["available"]) {
-                name
-                quantity
-            }
-            location {
+            barcode
+            price
+            inventoryItem {
                 id
             }
         }
@@ -713,32 +636,160 @@ mutation InventoryBulkToggleActivation($inventoryItemId: ID!, $inventoryItemUpda
 }
 """
  
-def activate_inventory_at_location(inventory_item_id, location_id):
-    data = graphql_request(ACTIVATE_INVENTORY_MUTATION, {
-        "inventoryItemId": inventory_item_id,
-        "inventoryItemUpdates": [{
-            "locationId": location_id,
-            "activate": True,
-        }],
-    }, operation_name="InventoryBulkToggleActivation")
+def update_variant(variant_id: str, source: Dict[str, Any]) -> Dict[str, Any]:
+    input_data = {
+        "id": variant_id,
+        "price": str(source["price"]),
+        "barcode": source["barcode"],
+        "weight": source["weight"],
+        "weightUnit": "GRAMS",
+    }
  
-    payload = data["inventoryBulkToggleActivation"]
-    raise_user_errors(payload.get("userErrors"), "Inventory location activation")
+    if source["sku"]:
+        input_data["sku"] = source["sku"]
+ 
+    data = graphql(VARIANT_UPDATE_MUTATION, {"input": input_data})
+    result = data.get("productVariantUpdate", {})
+    errors = result.get("userErrors", [])
+ 
+    if errors:
+        raise RuntimeError("Shopify productVariantUpdate errors: " + str(errors))
+ 
+    variant = result.get("productVariant")
+ 
+    if not variant:
+        raise RuntimeError("Shopify did not return updated variant.")
+ 
+    return variant
  
 # ============================================================
-# SET INVENTORY QUANTITY
+# INVENTORY
 # ============================================================
  
 INVENTORY_SET_MUTATION = """
 mutation InventorySetQuantities($input: InventorySetQuantitiesInput!) {
     inventorySetQuantities(input: $input) {
         inventoryAdjustmentGroup {
+            createdAt
             reason
-            changes {
-                name
-                delta
-                quantityAfterChange
+            referenceDocumentUri
+        }
+        userErrors {
+            field
+            message
+            code
+        }
+    }
+}
+"""
+ 
+def set_inventory_quantity(inventory_item_id: str, location_id: str, quantity: int) -> None:
+    quantity = max(0, int(quantity))
+    input_data = {
+        "name": "available",
+        "reason": "correction",
+        "ignoreCompareQuantity": True,
+        "quantities": [{
+            "inventoryItemId": inventory_item_id,
+            "locationId": location_id,
+            "quantity": quantity,
+        }]
+    }
+ 
+    data = graphql(INVENTORY_SET_MUTATION, {"input": input_data})
+    result = data.get("inventorySetQuantities", {})
+    errors = result.get("userErrors", [])
+ 
+    if errors:
+        raise RuntimeError("Shopify inventory errors: " + str(errors))
+ 
+# ============================================================
+# PRODUCT OPTIONS
+# ============================================================
+ 
+PRODUCT_OPTIONS_QUERY = """
+query ProductOptions($id: ID!) {
+    product(id: $id) {
+        id
+        options {
+            id
+            name
+            position
+            values
+        }
+        variants(first: 250) {
+            nodes {
+                id
+                title
+                sku
+                barcode
+                selectedOptions {
+                    name
+                    value
+                }
+                inventoryItem {
+                    id
+                    tracked
+                }
             }
+        }
+    }
+}
+"""
+ 
+def get_product_details(product_id: str) -> Dict[str, Any]:
+    data = graphql(PRODUCT_OPTIONS_QUERY, {"id": product_id})
+    product = data.get("product")
+ 
+    if not product:
+        raise RuntimeError(f"Shopify product not found: {product_id}")
+ 
+    return product
+ 
+# ============================================================
+# VARIANT MATCHING
+# ============================================================
+ 
+def find_matching_variant(product: Dict[str, Any], source: Dict[str, Any], size: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    variants = product.get("variants", {}).get("nodes", [])
+ 
+    # 1. SKU match
+    if source["sku"]:
+        for variant in variants:
+            if str(variant.get("sku") or "") == str(source["sku"]):
+                return variant
+ 
+    # 2. Barcode match
+    if source["barcode"]:
+        for variant in variants:
+            if str(variant.get("barcode") or "") == str(source["barcode"]):
+                return variant
+ 
+    # 3. Size / option match
+    if size:
+        size_lower = size.strip().lower()
+        for variant in variants:
+            selected_options = variant.get("selectedOptions", [])
+            for option in selected_options:
+                if str(option.get("value", "")).strip().lower() == size_lower:
+                    return variant
+ 
+    # 4. Single variant fallback
+    if len(variants) == 1:
+        return variants[0]
+ 
+    return None
+ 
+# ============================================================
+# TRACK INVENTORY
+# ============================================================
+ 
+INVENTORY_ITEM_UPDATE_MUTATION = """
+mutation InventoryItemUpdate($id: ID!, $input: InventoryItemInput!) {
+    inventoryItemUpdate(id: $id, input: $input) {
+        inventoryItem {
+            id
+            tracked
         }
         userErrors {
             field
@@ -748,52 +799,173 @@ mutation InventorySetQuantities($input: InventorySetQuantitiesInput!) {
 }
 """
  
-def set_inventory_quantity(inventory_item_id, location_id, quantity):
-    quantity = max(0, int(quantity))
-    data = graphql_request(INVENTORY_SET_MUTATION, {
+def ensure_inventory_tracked(inventory_item_id: str) -> None:
+    data = graphql(INVENTORY_ITEM_UPDATE_MUTATION, {
+        "id": inventory_item_id,
         "input": {
-            "name": "available",
-            "reason": "correction",
-            "referenceDocumentUri": "supplier-feed://" + str(uuid.uuid4()),
-            "ignoreCompareQuantity": True,
-            "quantities": [{
-                "inventoryItemId": inventory_item_id,
-                "locationId": location_id,
-                "quantity": quantity,
-            }],
-        }
-    }, operation_name="InventorySetQuantities")
+            "tracked": True
+        },
+    })
  
-    payload = data["inventorySetQuantities"]
-    raise_user_errors(payload.get("userErrors"), "Inventory quantity update")
+    result = data.get("inventoryItemUpdate", {})
+    errors = result.get("userErrors", [])
+ 
+    if errors:
+        raise RuntimeError("Shopify inventoryItemUpdate errors: " + str(errors))
+ 
+# ============================================================
+# IMAGES
+# ============================================================
+ 
+IMAGE_CREATE_MUTATION = """
+mutation ProductCreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
+    productCreateMedia(productId: $productId, media: $media) {
+        media {
+            id
+        }
+        mediaUserErrors {
+            field
+            message
+        }
+    }
+}
+"""
+ 
+def update_images(product_id: str, image_urls: List[str]) -> None:
+    if not image_urls:
+        return
+ 
+    media = []
+    for url in image_urls:
+        media.append({
+            "originalSource": url,
+            "mediaContentType": "IMAGE",
+        })
+ 
+    # Shopify limits mutation payload size. Process images in small batches.
+    for start in range(0, len(media), 10):
+        batch = media[start:start + 10]
+        data = graphql(IMAGE_CREATE_MUTATION, {
+            "productId": product_id,
+            "media": batch,
+        })
+ 
+        result = data.get("productCreateMedia", {})
+        errors = result.get("mediaUserErrors", [])
+ 
+        if errors:
+            raise RuntimeError("Shopify image errors: " + str(errors))
+ 
+# ============================================================
+# STATUS
+# ============================================================
+ 
+def update_product_status(product_id: str, stock: int) -> None:
+    status = "ACTIVE" if stock > 0 else "DRAFT"
+    mutation = """
+    mutation ProductUpdate($input: ProductUpdateInput!) {
+        productUpdate(product: $input) {
+            product {
+                id
+                status
+            }
+            userErrors {
+                field
+                message
+            }
+        }
+    }
+    """
+ 
+    data = graphql(mutation, {
+        "input": {
+            "id": product_id,
+            "status": status,
+        }
+    })
+ 
+    result = data.get("productUpdate", {})
+    errors = result.get("userErrors", [])
+ 
+    if errors:
+        raise RuntimeError("Shopify status update errors: " + str(errors))
+ 
+# ============================================================
+# SYNC EXISTING PRODUCT
+# ============================================================
+ 
+def sync_existing_product(product: Dict[str, Any], source: Dict[str, Any], location_id: str) -> None:
+    product_id = product["id"]
+    details = get_product_details(product_id)
+    variants = details.get("variants", {}).get("nodes", [])
+ 
+    if not variants:
+        raise RuntimeError("Existing product has no variants.")
+ 
+    # --------------------------------------------------------
+    # Determine variant
+    # --------------------------------------------------------
+    sizes = source["sizes"]
+ 
+    if sizes:
+        for size in sizes:
+            variant = find_matching_variant(details, source, size)
+ 
+            if not variant:
+                raise RuntimeError(f"Could not match Shopify variant for size '{size}'.")
+ 
+            updated_variant = update_variant(variant["id"], source)
+            inventory_item_id = updated_variant.get("inventoryItem", {}).get("id") or variant.get("inventoryItem", {}).get("id")
+ 
+            if not inventory_item_id:
+                raise RuntimeError("Variant has no inventory item.")
+ 
+            ensure_inventory_tracked(inventory_item_id)
+            set_inventory_quantity(inventory_item_id, location_id, source["stock"])
+ 
+    else:
+        variant = find_matching_variant(details, source)
+ 
+        if not variant:
+            raise RuntimeError("Could not match existing Shopify variant by SKU, barcode or single variant fallback.")
+ 
+        updated_variant = update_variant(variant["id"], source)
+        inventory_item_id = updated_variant.get("inventoryItem", {}).get("id") or variant.get("inventoryItem", {}).get("id")
+ 
+        if not inventory_item_id:
+            raise RuntimeError("Variant has no inventory item.")
+ 
+        ensure_inventory_tracked(inventory_item_id)
+        set_inventory_quantity(inventory_item_id, location_id, source["stock"])
+ 
+    # --------------------------------------------------------
+    # Product information
+    # --------------------------------------------------------
+    if UPDATE_PRODUCT_DATA:
+        update_product_data(product_id, source)
+ 
+    # --------------------------------------------------------
+    # Product status
+    # --------------------------------------------------------
+    update_product_status(product_id, source["stock"])
+ 
+    # --------------------------------------------------------
+    # Images
+    # --------------------------------------------------------
+    if UPDATE_IMAGES and source["images"]:
+        update_images(product_id, source["images"])
  
 # ============================================================
 # CREATE PRODUCT
 # ============================================================
  
-PRODUCT_SET_CREATE_MUTATION = """
-mutation ProductSetCreate($input: ProductSetInput!, $synchronous: Boolean!) {
-    productSet(input: $input, synchronous: $synchronous) {
+PRODUCT_CREATE_MUTATION = """
+mutation ProductCreate($input: ProductInput!) {
+    productCreate(input: $input) {
         product {
             id
             title
             handle
-            variants(first: 250) {
-                nodes {
-                    id
-                    title
-                    sku
-                    barcode
-                    inventoryItem {
-                        id
-                        sku
-                    }
-                    selectedOptions {
-                        name
-                        value
-                    }
-                }
-            }
         }
         userErrors {
             field
@@ -803,11 +975,8 @@ mutation ProductSetCreate($input: ProductSetInput!, $synchronous: Boolean!) {
 }
 """
  
-def create_product(source):
-    # --------------------------------------------------------
-    # PRODUCT DATA
-    # --------------------------------------------------------
-    product_input = {
+def create_product(source: Dict[str, Any]) -> str:
+    input_data = {
         "title": source["title"],
         "handle": source["handle"],
         "descriptionHtml": source["description"],
@@ -817,148 +986,131 @@ def create_product(source):
         "status": "ACTIVE" if source["stock"] > 0 else "DRAFT",
     }
  
-    # --------------------------------------------------------
-    # VARIANTS
-    # --------------------------------------------------------
-    sizes = source["sizes"] or ["Default Title"]
+    # Only send product options when the source actually has sizes.
+    if source["sizes"]:
+        input_data["productOptions"] = [{
+            "name": "Size",
+            "values": [{"name": size} for size in source["sizes"]],
+        }]
  
-    # --------------------------------------------------------
-    # PRODUCT OPTION
-    # --------------------------------------------------------
-    product_input["productOptions"] = [{
-        "name": "Size",
-        "position": 1,
-        "values": [{"name": size} for size in sizes],
-    }]
+    data = graphql(PRODUCT_CREATE_MUTATION, {"input": input_data})
+    result = data.get("productCreate", {})
+    errors = result.get("userErrors", [])
  
-    variants = []
+    if errors:
+        raise RuntimeError("Shopify productCreate errors: " + str(errors))
+ 
+    product = result.get("product")
+ 
+    if not product:
+        raise RuntimeError("Shopify did not return created product.")
+ 
+    return product["id"]
+ 
+# ============================================================
+# CREATE VARIANTS
+# ============================================================
+ 
+PRODUCT_VARIANTS_BULK_CREATE = """
+mutation ProductVariantsBulkCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+    productVariantsBulkCreate(product: $productId, variants: $variants) {
+        productVariants {
+            id
+            title
+            inventoryItem {
+                id
+            }
+        }
+        userErrors {
+            field
+            message
+        }
+    }
+}
+"""
+ 
+def create_variants(product_id: str, source: Dict[str, Any]) -> List[Dict[str, Any]]:
+    variants_input = []
+    sizes = source["sizes"] or [None]
+ 
     for size in sizes:
-        variant = {
-            "optionValues": [{"optionName": "Size", "name": size}],
+        item = {
             "price": str(source["price"]),
-            "barcode": source["barcode"] or None,
-            "sku": source["sku"] or None,
-            "inventoryItem": {
-                "cost": source["cost"],
-                "tracked": True,
-                "sku": source["sku"] or None,
-                "measurement": {
-                    "weight": {
-                        "value": source["weight"],
-                        "unit": "GRAMS",
-                    }
-                },
-            },
+            "barcode": source["barcode"],
         }
  
-        # Remove None values.
-        variant = {key: value for key, value in variant.items() if value is not None}
-        if variant.get("inventoryItem"):
-            variant["inventoryItem"] = {key: value for key, value in variant["inventoryItem"].items() if value is not None}
+        # IMPORTANT: Do NOT put SKU here.
+        # ProductVariantsBulkInput does not accept sku on the Shopify API version/schema.
+        if size:
+            item["optionValues"] = [{"optionName": "Size", "name": size}]
  
-        variants.append(variant)
+        variants_input.append(item)
  
-    product_input["variants"] = variants
-    data = graphql_request(PRODUCT_SET_CREATE_MUTATION, {
-        "input": product_input,
-        "synchronous": True,
-    }, operation_name="ProductSetCreate")
+    data = graphql(PRODUCT_VARIANTS_BULK_CREATE, {
+        "productId": product_id,
+        "variants": variants_input,
+    })
  
-    payload = data["productSet"]
-    raise_user_errors(payload.get("userErrors"), "Product creation")
+    result = data.get("productVariantsBulkCreate", {})
+    errors = result.get("userErrors", [])
  
-    product = payload.get("product")
-    if not product:
-        raise RuntimeError("Shopify returned no product after creation.")
+    if errors:
+        raise RuntimeError("Shopify productVariantsBulkCreate errors: " + str(errors))
  
-    return product
+    return result.get("productVariants", [])
  
 # ============================================================
-# SYNC EXISTING PRODUCT
+# CREATE PRODUCT COMPLETE
 # ============================================================
  
-def sync_existing_product(product, source, location_id):
-    product_id = product["id"]
+def create_complete_product(source: Dict[str, Any], location_id: str) -> None:
+    product_id = create_product(source)
+    variants = create_variants(product_id, source)
  
-    # --------------------------------------------------------
-    # PRODUCT INFORMATION
-    # --------------------------------------------------------
-    if UPDATE_PRODUCT_DATA:
-        update_product_data(product_id, source)
+    if not variants:
+        raise RuntimeError("Product was created but no variants were returned.")
  
-    # --------------------------------------------------------
-    # MATCH VARIANT
-    # --------------------------------------------------------
-    variant = find_matching_variant(product, source)
-    if not variant:
-        raise RuntimeError(
-            "Could not match supplier item to "
-            f"an existing Shopify variant. SKU={source['sku']} "
-            f"Barcode={source['barcode']}"
-        )
+    # Update each newly created variant.
+    for variant in variants:
+        variant_input = {
+            "id": variant["id"],
+            "price": str(source["price"]),
+            "barcode": source["barcode"],
+            "weight": source["weight"],
+            "weightUnit": "GRAMS",
+        }
  
-    # --------------------------------------------------------
-    # VARIANT
-    # --------------------------------------------------------
-    update_variant(product_id, variant, source)
+        if source["sku"]:
+            variant_input["sku"] = source["sku"]
  
-    # --------------------------------------------------------
-    # INVENTORY ITEM
-    # --------------------------------------------------------
-    inventory_item_id = variant["inventoryItem"]["id"]
-    if UPDATE_INVENTORY_ITEM:
-        update_inventory_item(variant, source)
+        data = graphql(VARIANT_UPDATE_MUTATION, {"input": variant_input})
+        result = data.get("productVariantUpdate", {})
+        errors = result.get("userErrors", [])
  
-    # --------------------------------------------------------
-    # LOCATION
-    # --------------------------------------------------------
-    if UPDATE_INVENTORY:
-        activate_inventory_at_location(inventory_item_id, location_id)
+        if errors:
+            raise RuntimeError("Shopify variant creation/update errors: " + str(errors))
+ 
+        updated = result.get("productVariant")
+ 
+        if not updated:
+            raise RuntimeError("Shopify did not return created variant.")
+ 
+        inventory_item_id = updated.get("inventoryItem", {}).get("id") or variant.get("inventoryItem", {}).get("id")
+ 
+        if not inventory_item_id:
+            raise RuntimeError("Created variant has no inventory item.")
+ 
+        ensure_inventory_tracked(inventory_item_id)
         set_inventory_quantity(inventory_item_id, location_id, source["stock"])
  
-# ============================================================
-# SYNC NEW PRODUCT
-# ============================================================
- 
-def sync_new_product(source, location_id):
-    product = create_product(source)
-    product_id = product["id"]
- 
-    print(f"🆕 Created: {source['title']}")
- 
-    # --------------------------------------------------------
-    # Refresh product so we have inventory item IDs.
-    # --------------------------------------------------------
-    refreshed = find_product_by_handle(source["handle"])
-    if not refreshed:
-        raise RuntimeError("Product was created but could not be found again by handle.")
- 
-    variants = refreshed.get("variants", {}).get("nodes", [])
-    if not variants:
-        raise RuntimeError("Created product has no variants.")
- 
-    # --------------------------------------------------------
-    # Update every created variant's inventory.
-    # --------------------------------------------------------
-    for variant in variants:
-        inventory_item_id = variant.get("inventoryItem", {}).get("id")
-        if not inventory_item_id:
-            continue
- 
-        if UPDATE_INVENTORY_ITEM:
-            update_inventory_item(variant, source)
- 
-        if UPDATE_INVENTORY:
-            activate_inventory_at_location(inventory_item_id, location_id)
-            set_inventory_quantity(inventory_item_id, location_id, source["stock"])
- 
-    return product_id
+    if UPDATE_IMAGES and source["images"]:
+        update_images(product_id, source["images"])
  
 # ============================================================
 # SYNC ONE PRODUCT
 # ============================================================
  
-def sync_product(index, total, source_item, location_id):
+def sync_product(source_item: Dict[str, Any], location_id: str, index: int, total: int) -> Tuple[str, str]:
     source = build_source_product(source_item)
     title = source["title"]
  
@@ -974,56 +1126,61 @@ def sync_product(index, total, source_item, location_id):
     print(f"   Stock: {source['stock']}")
  
     # --------------------------------------------------------
-    # FIND EXISTING PRODUCT
+    # Find by handle
     # --------------------------------------------------------
     existing = find_product_by_handle(source["handle"])
  
     # --------------------------------------------------------
-    # UPDATE
+    # Fallback by SKU / barcode
+    # --------------------------------------------------------
+    if not existing:
+        existing = find_product_by_sku_or_barcode(source["sku"], source["barcode"])
+ 
+    # --------------------------------------------------------
+    # Existing
     # --------------------------------------------------------
     if existing:
         print(f"🔄 Existing product found: {existing['title']}")
         print(f"   Shopify ID: {existing['id']}")
         sync_existing_product(existing, source, location_id)
-        print(f"✅ Updated successfully: {title}")
-        return "updated"
+        print(f"✅ Updated: {title}")
+        return "updated", title
  
     # --------------------------------------------------------
-    # CREATE
+    # New
     # --------------------------------------------------------
-    if not CREATE_MISSING_PRODUCTS:
-        print("⚠️ Product not found and CREATE_MISSING_PRODUCTS=false")
-        return "skipped"
- 
-    sync_new_product(source, location_id)
-    print(f"✅ Created successfully: {title}")
-    return "created"
+    print("🆕 Product not found - creating...")
+    create_complete_product(source, location_id)
+    print(f"✅ Created: {title}")
+    return "created", title
  
 # ============================================================
 # MAIN SYNC
 # ============================================================
  
 def run_sync():
-    global SHOP_URL
-    validate_config()
- 
     print("\n" + "=" * 70)
     print("🚀 SHOPIFY SUPPLIER SYNC")
     print("=" * 70)
  
     print(f"🏪 Shop: {SHOP_URL}")
-    print(f"🔌 Shopify API: {API_VERSION}")
-    print(f"👷 Workers: {MAX_WORKERS}")
-    print(f"📋 Limit: {LIMIT if LIMIT is not None else 'ALL'}")
-    print(f"📦 Inventory updates: {UPDATE_INVENTORY}")
-    print(f"💷 Price updates: {UPDATE_PRICES}")
+    print(f"🔢 API version: {API_VERSION}")
+    print(f"👷 Workers: {WORKERS}")
+    print(f"📦 Limit: {LIMIT if LIMIT is not None else 'ALL'}")
+    print(f"⏱️ Timeout: {REQUEST_TIMEOUT}s")
     print("=" * 70)
  
     # --------------------------------------------------------
-    # LOCATION
+    # Token
+    # --------------------------------------------------------
+    get_access_token()
+    print("🔐 Shopify authentication: OK")
+ 
+    # --------------------------------------------------------
+    # Location
     # --------------------------------------------------------
     location_id = resolve_location_id()
-    print(f"📍 Using location ID: {location_id}")
+    print(f"📍 Using location: {location_id}")
  
     # --------------------------------------------------------
     # XML
@@ -1038,98 +1195,80 @@ def run_sync():
     print(f"🚀 Starting sync of {total} products...")
     print("=" * 70)
  
+    # --------------------------------------------------------
+    # Counters
+    # --------------------------------------------------------
     created = 0
     updated = 0
-    skipped = 0
     failed = 0
     failures = []
  
     # --------------------------------------------------------
-    # THREAD POOL
+    # Thread pool
     # --------------------------------------------------------
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_index = {}
-        for index, item in enumerate(items, start=1):
-            future = executor.submit(sync_product, index, total, item, location_id)
-            future_to_index[future] = (index, item)
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        future_to_meta = {}
  
-        # ----------------------------------------------------
-        # COLLECT RESULTS
-        # ----------------------------------------------------
-        completed = 0
-        for future in as_completed(future_to_index):
-            index, item = future_to_index[future]
-            completed += 1
+        for index, item in enumerate(items, start=1):
+            future = executor.submit(sync_product, item, location_id, index, total)
+            future_to_meta[future] = (index, item)
+ 
+        for future in as_completed(future_to_meta):
+            index, item = future_to_meta[future]
             title = clean_text(item.get("title"))
  
             try:
-                result = future.result()
+                result, result_title = future.result()
+ 
                 if result == "created":
                     created += 1
                 elif result == "updated":
                     updated += 1
-                elif result == "skipped":
-                    skipped += 1
                 else:
                     failed += 1
  
             except Exception as exc:
                 failed += 1
+                error_text = str(exc)
+                failures.append({"index": index, "title": title, "error": error_text})
+ 
                 print("\n" + "!" * 70)
                 print(f"❌ ERROR syncing {title}")
-                print(f"   Product #{index}")
-                print(f"   Error: {exc}")
+                print(f"   {error_text}")
                 print("!" * 70)
-                failures.append({
-                    "index": index,
-                    "title": title,
-                    "sku": clean_text(item.get("sku")),
-                    "barcode": clean_text(item.get("barcode")),
-                    "error": str(exc),
-                })
  
-            # ------------------------------------------------
-            # PROGRESS
-            # ------------------------------------------------
-            if completed % 25 == 0 or completed == total:
-                print("\n" + "-" * 70)
-                print(f"📊 Progress: {completed}/{total} ({completed / total * 100:.1f}%)")
-                print(f"   Created: {created}")
-                print(f"   Updated: {updated}")
-                print(f"   Skipped: {skipped}")
-                print(f"   Failed:  {failed}")
-                print("-" * 70)
- 
-    # ========================================================
-    # SUMMARY
-    # ========================================================
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
     print("\n" + "=" * 70)
     print("✅ SYNC COMPLETE")
     print("=" * 70)
     print(f"🆕 Created: {created}")
     print(f"🔄 Updated: {updated}")
-    print(f"⏭️ Skipped: {skipped}")
     print(f"❌ Failed:  {failed}")
     print(f"📦 Total:   {total}")
     print("=" * 70)
  
     # --------------------------------------------------------
-    # FAILURE REPORT
+    # Failure report
     # --------------------------------------------------------
     if failures:
         print("\n" + "=" * 70)
-        print("❌ FAILED PRODUCTS")
+        print(f"❌ FAILURE SUMMARY ({len(failures)} products)")
         print("=" * 70)
+ 
         for failure in failures:
             print(f"[{failure['index']}] {failure['title']}")
-            print(f"   SKU: {failure['sku']}")
-            print(f"   Barcode: {failure['barcode']}")
-            print(f"   Error: {failure['error']}")
-            print("-" * 70)
+            print(f"    {failure['error']}")
+        
+        print("=" * 70)
+    else:
+        print("\n🎉 No products failed.")
  
 # ============================================================
-# RUN
+# ENTRY POINT
 # ============================================================
+ 
 if __name__ == "__main__":
     try:
         run_sync()
@@ -1137,4 +1276,3 @@ if __name__ == "__main__":
         print("\n🛑 Sync cancelled by user.")
     except Exception as exc:
         print("\n❌ SYNC STOPPED:")
-        print(str(exc))
