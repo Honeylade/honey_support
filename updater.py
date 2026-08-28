@@ -368,6 +368,10 @@ def run_sync():
     print("🚀 SHOPIFY SUPPLIER SYNC")
     print("=" * 70)
  
+    # Refresh the access token at the start
+    token = get_access_token()
+    HEADERS["X-Shopify-Access-Token"] = token  # Update headers with the new token
+ 
     if not SHOP_URL:
         raise RuntimeError("SHOP_URL is not configured.")
     if not ACCESS_TOKEN:
