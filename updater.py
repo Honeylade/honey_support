@@ -36,7 +36,7 @@ else:
 # ------------------------------------------------------------
 # Increase to up to 6
 
-WORKERS = int(os.getenv("WORKERS", "4"))
+WORKERS = int(os.getenv("WORKERS", "5"))
 
 # ------------------------------------------------------------
 # RETRIES
