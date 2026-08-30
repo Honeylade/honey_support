@@ -722,28 +722,28 @@ mutation ProductVariantsBulkUpdate(
 """
 
 def update_variant(product_id: str, variant_id: str, source: Dict[str, Any]) -> Dict[str, Any]:
-    variants_input.append({
-    "optionValues": [{"optionName": "Size", "name": size}],  # Ensure the optionName is set correctly
-    "price": str(source["price"]),
-    "barcode": source["barcode"],
-    "inventoryItem": {
-        "tracked": True,
-        "sku": source["sku"],
-        "cost": source["cost"],
-        "measurement": {
-            "weight": {
-                "value": source["weight"],
-                "unit": "GRAMS",
-            }
+    variants_input = [{
+        "optionValues": [{"optionName": "Size", "name": size}],  # Ensure the optionName is set correctly
+        "price": str(source["price"]),
+        "barcode": source["barcode"],
+        "inventoryItem": {
+            "tracked": True,
+            "sku": source["sku"],
+            "cost": source["cost"],
+            "measurement": {
+                "weight": {
+                    "value": source["weight"],
+                    "unit": "GRAMS",
+                }
+            },
         },
-    },
-})
-    
+    } for size in source["sizes"]]  # Make sure to iterate over sizes
+
     data = graphql(
         VARIANTS_UPDATE_MUTATION,
         {
             "productId": product_id,
-            "variants": [variant_input],
+            "variants": variants_input,
         }
     )
 
