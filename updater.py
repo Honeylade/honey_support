@@ -220,6 +220,12 @@ def split_tags(value) -> List[str]:
         if t.strip()
     ]
 
+def sanitize_title(title):
+    if not title:
+        return []
+    title_cleaned = re.sub(r"[^a-zA-Z0-9\s]", "", title)  # Remove special characters
+    return [t.strip() for t in title_cleaned.split() if t.strip()]
+
 def sanitize_tags(tags: List[str]) -> List[str]:
     result = []
     seen = set()
