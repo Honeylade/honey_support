@@ -24,10 +24,6 @@ API_VERSION = os.getenv("API_VERSION", "2026-07").strip()
 # ------------------------------------------------------------
 # LIMIT
 # ------------------------------------------------------------
-
-# LIMIT=10 -> test first 10
-# LIMIT=0 / blank / None -> all products
-
 LIMIT_RAW = os.getenv("LIMIT", "").strip()
 
 if not LIMIT_RAW or LIMIT_RAW.lower() in ("none", "0", "all"):
