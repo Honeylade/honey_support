@@ -132,8 +132,19 @@ def get_inventory_lock(inventory_item_id: str, location_id: str):
 def get_access_token() -> str:
     """
     Gets a Shopify client-credentials access token and caches it.
+
+    Retries temporary network/HTTP failures so that a short GitHub
+    Actions or Shopify connectivity problem does not immediately
+    kill
+    the entire sync.
     """
+
     with _token_lock:
+
+        # --------------------------------------------------------
+        # USE CACHED TOKEN IF STILL VALID
+        # --------------------------------------------------------
+
         if (
             _token_cache["access_token"]
             and time.time() < _token_cache["expires_at"] - 60
@@ -157,34 +168,161 @@ def get_access_token() -> str:
             "grant_type": "client_credentials",
         }
 
-        response = requests.post(
-            url,
-            json=data,
-            timeout=REQUEST_TIMEOUT,
+        # --------------------------------------------------------
+        # TOKEN REQUEST RETRIES
+        # --------------------------------------------------------
+
+        last_error = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+
+            try:
+
+                print(
+                    f"🔐 Requesting Shopify access token "
+                    f"(attempt {attempt}/{MAX_RETRIES})..."
+                )
+
+                response = requests.post(
+                    url,
+                    json=data,
+                    timeout=REQUEST_TIMEOUT,
+                )
+
+                # ------------------------------------------------
+                # TEMPORARY HTTP ERRORS
+                # ------------------------------------------------
+
+                if response.status_code in (
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                ):
+
+                    retry_after = response.headers.get(
+                        "Retry-After"
+                    )
+
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except (ValueError, TypeError):
+                            delay = RETRY_DELAY * attempt
+                    else:
+                        delay = RETRY_DELAY * attempt
+
+                    if attempt < MAX_RETRIES:
+
+                        print(
+                            f"⚠️ Token request returned HTTP "
+                            f"{response.status_code}."
+                        )
+
+                        print(
+                            f"   Retrying in {delay:.1f} seconds..."
+                        )
+
+                        time.sleep(delay)
+                        continue
+
+                    raise RuntimeError(
+                        "Shopify access-token request failed "
+                        f"after {MAX_RETRIES} attempts: "
+                        f"HTTP {response.status_code}: "
+                        f"{response.text[:1000]}"
+                    )
+
+                # ------------------------------------------------
+                # NON-RETRYABLE HTTP ERRORS
+                # ------------------------------------------------
+
+                if not response.ok:
+
+                    raise RuntimeError(
+                        "Shopify token request failed: "
+                        f"HTTP {response.status_code}: "
+                        f"{response.text[:1000]}"
+                    )
+
+                # ------------------------------------------------
+                # PARSE RESPONSE
+                # ------------------------------------------------
+
+                token_data = response.json()
+
+                token = token_data.get("access_token")
+
+                if not token:
+
+                    raise RuntimeError(
+                        "Shopify token response did not contain "
+                        f"access_token: {token_data}"
+                    )
+
+                expires_in = int(
+                    token_data.get(
+                        "expires_in",
+                        86400,
+                    )
+                )
+
+                _token_cache["access_token"] = token
+
+                _token_cache["expires_at"] = (
+                    time.time() + expires_in
+                )
+
+                print("✅ Shopify access token obtained.")
+
+                return token
+
+            # ----------------------------------------------------
+            # NETWORK ERRORS
+            # ----------------------------------------------------
+
+            except requests.RequestException as exc:
+
+                last_error = exc
+
+                if attempt < MAX_RETRIES:
+
+                    delay = RETRY_DELAY * attempt
+
+                    print(
+                        f"⚠️ Network error while obtaining "
+                        f"Shopify access token: {exc}"
+                    )
+
+                    print(
+                        f"   Retrying in {delay:.1f} seconds "
+                        f"({attempt}/{MAX_RETRIES})..."
+                    )
+
+                    time.sleep(delay)
+
+                    continue
+
+                break
+
+            # ----------------------------------------------------
+            # UNEXPECTED ERRORS
+            # ----------------------------------------------------
+
+            except Exception as exc:
+
+                last_error = exc
+
+                # Configuration/authentication errors should
+                # not be blindly retried.
+
+                raise
+
+        raise RuntimeError(
+            "Shopify access-token request failed after "
+            f"{MAX_RETRIES} attempts: {last_error}"
         )
-
-        if not response.ok:
-            raise RuntimeError(
-                f"Shopify token request failed: "
-                f"HTTP {response.status_code}: {response.text[:1000]}"
-            )
-
-        token_data = response.json()
-        token = token_data.get("access_token")
-
-        if not token:
-            raise RuntimeError(
-                f"Shopify token response did not contain access_token: "
-                f"{token_data}"
-            )
-
-        expires_in = int(token_data.get("expires_in", 86400))
-
-        _token_cache["access_token"] = token
-        _token_cache["expires_at"] = time.time() + expires_in
-
-        return token
-
 # ============================================================
 # PRICE LOGIC
 # ============================================================
