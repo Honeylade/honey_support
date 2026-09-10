@@ -496,7 +496,7 @@ def parse_xml_feed(content: bytes) -> Set[str]:
             if "sku" in name or ("product" in name and "id" in name) or name in {
                 "itemid",
                 "itemcode",
-                "productid",
+                "productcode",
             }:
                 candidates.add(local_name(element.tag))
         raise RuntimeError(
