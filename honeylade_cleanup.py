@@ -1,1400 +1,802 @@
+#!/usr/bin/env python3
+"""
+Honeylade Shopify Cleanup
+
+Removes Shopify products that are managed by the Honeylade tag but whose
+supplier Product ID/SKU no longer exists in the current supplier feed.
+
+IMPORTANT:
+- Only products with HONEYLADE_TAG are considered.
+- DRY_RUN defaults to true.
+- Deletion is permanent when DRY_RUN=false.
+- The supplier feed may be CSV or XML; format is detected automatically.
+- CSV feeds use Product ID (or SKU-like column) as the authoritative ID.
+- XML feeds are parsed flexibly and common Product ID/SKU field names are
+  recognised, including nested XML elements and attributes.
+"""
+
 import csv
 import io
 import os
+import re
 import sys
 import time
-import uuid
+import xml.etree.ElementTree as ET
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
 import requests
 
-from typing import Dict, List, Set, Optional
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+SHOP_URL = os.environ.get("SHOP_URL", "").strip().rstrip("/")
+XML_URL = os.environ.get("XML_URL", "").strip()
+CLIENT_ID = os.environ.get("CLIENT_ID", "").strip()
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "").strip()
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+API_VERSION = os.environ.get("API_VERSION", "2026-07").strip()
+HONEYLADE_TAG = os.environ.get("HONEYLADE_TAG", "honeylade").strip()
 
-SHOP_URL = os.getenv("SHOP_URL", "").strip()
-XML_URL = os.getenv("XML_URL", "").strip()
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "6"))
+RETRY_DELAY = float(os.environ.get("RETRY_DELAY", "5"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "60"))
 
-CLIENT_ID = os.getenv("CLIENT_ID", "").strip()
-CLIENT_SECRET = os.getenv("CLIENT_SECRET", "").strip()
-
-API_VERSION = os.getenv(
-    "API_VERSION",
-    "2026-07",
-).strip()
-
-# Product tag that identifies products managed by Honeylade.
-HONEYLADE_TAG = os.getenv(
-    "HONEYLADE_TAG",
-    "honeylade",
-).strip()
-
-# Number of products Shopify returns per page.
-PAGE_SIZE = int(
-    os.getenv("PAGE_SIZE", "100")
-)
-
-# Retry settings.
-MAX_RETRIES = int(
-    os.getenv("MAX_RETRIES", "6")
-)
-
-RETRY_DELAY = float(
-    os.getenv("RETRY_DELAY", "5")
-)
-
-REQUEST_TIMEOUT = int(
-    os.getenv("REQUEST_TIMEOUT", "60")
-)
-
-# ------------------------------------------------------------
-# SAFETY
-# ------------------------------------------------------------
-
-# IMPORTANT:
-# Set DRY_RUN=true first.
-#
-# When true, the script reports what it WOULD delete,
-# but does not delete anything.
-DRY_RUN = os.getenv(
-    "DRY_RUN",
-    "true",
-).strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "y",
-)
-
-# Prevent an unexpectedly small/broken feed from deleting
-# a large portion of the Honeylade catalogue.
-#
-# Example:
-# If Shopify has 2,000 Honeylade products and the feed only
-# contains 10 products, the script stops instead of deleting
-# 1,990 products.
-MIN_FEED_PRODUCTS = int(
-    os.getenv(
-        "MIN_FEED_PRODUCTS",
-        "10",
-    )
-)
-
-# Maximum percentage of Honeylade products that may be
-# deleted in one run.
-#
-# 25 means the script refuses to delete more than 25%.
-MAX_DELETE_PERCENT = float(
-    os.getenv(
-        "MAX_DELETE_PERCENT",
-        "25",
-    )
-)
-
-# Optional absolute maximum.
-#
-# Example:
-# MAX_DELETE_COUNT=100 means never delete more than 100
-# products in a single run.
-MAX_DELETE_COUNT = int(
-    os.getenv(
-        "MAX_DELETE_COUNT",
-        "100",
-    )
-)
-
-
-# ============================================================
-# TOKEN CACHE
-# ============================================================
-
-_token_cache = {
-    "access_token": None,
-    "expires_at": 0,
+DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() not in {
+    "false", "0", "no", "off"
 }
+MIN_FEED_PRODUCTS = int(os.environ.get("MIN_FEED_PRODUCTS", "100"))
+MAX_DELETE_PERCENT = float(os.environ.get("MAX_DELETE_PERCENT", "25"))
+MAX_DELETE_COUNT = int(os.environ.get("MAX_DELETE_COUNT", "100"))
+
+GRAPHQL_URL = f"{SHOP_URL}/admin/api/{API_VERSION}/graphql.json"
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+# ---------------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------------
+def log(message: str = "") -> None:
+    print(message, flush=True)
 
-def require_environment() -> None:
 
-    missing = []
+def normalise_identifier(value: Any) -> str:
+    """Normalise supplier/Shopify identifiers for reliable comparison."""
+    if value is None:
+        return ""
 
-    if not SHOP_URL:
-        missing.append("SHOP_URL")
+    text = str(value).strip()
+    if not text:
+        return ""
 
-    if not XML_URL:
-        missing.append("XML_URL")
+    # Remove a UTF-8 BOM and surrounding whitespace/quotes.
+    text = text.lstrip("\ufeff").strip().strip('"').strip()
 
-    if not CLIENT_ID:
-        missing.append("CLIENT_ID")
+    # Excel/pandas-style numeric IDs sometimes become 12345.0.
+    if re.fullmatch(r"\d+\.0", text):
+        text = text[:-2]
 
-    if not CLIENT_SECRET:
-        missing.append("CLIENT_SECRET")
+    return text.casefold()
 
-    if missing:
+
+def local_name(tag: str) -> str:
+    """Return an XML tag without namespace."""
+    if not tag:
+        return ""
+    return tag.rsplit("}", 1)[-1].strip().casefold()
+
+
+def normalise_key(value: str) -> str:
+    """Normalise a field name for fuzzy matching."""
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+# ---------------------------------------------------------------------------
+# Shopify authentication / HTTP
+# ---------------------------------------------------------------------------
+def get_access_token() -> str:
+    if not SHOP_URL or not CLIENT_ID or not CLIENT_SECRET:
         raise RuntimeError(
-            "Missing required environment variables: "
-            + ", ".join(missing)
+            "SHOP_URL, CLIENT_ID and CLIENT_SECRET must be configured."
         )
 
-
-# ============================================================
-# SHOPIFY ACCESS TOKEN
-# ============================================================
-
-def get_access_token() -> str:
-
-    cached_token = _token_cache.get(
-        "access_token"
-    )
-
-    expires_at = _token_cache.get(
-        "expires_at",
-        0,
-    )
-
-    if (
-        cached_token
-        and time.time() < expires_at - 60
-    ):
-        return cached_token
-
-    url = (
-        f"https://{SHOP_URL}"
-        "/admin/oauth/access_token"
-    )
-
+    url = f"{SHOP_URL}/admin/oauth/access_tokens"
     payload = {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "grant_type": "client_credentials",
     }
 
-    last_error = None
+    last_error: Optional[Exception] = None
 
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1,
-    ):
-
+    for attempt in range(1, MAX_RETRIES + 1):
+        log(f"🔐 Requesting Shopify access token (attempt {attempt}/{MAX_RETRIES})...")
         try:
+            response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
 
-            print(
-                f"🔐 Requesting Shopify access token "
-                f"(attempt {attempt}/{MAX_RETRIES})..."
+            if response.status_code == 200:
+                data = response.json()
+                token = data.get("access_token")
+                if not token:
+                    raise RuntimeError("Shopify response did not contain access_token.")
+                log("✅ Shopify access token obtained.")
+                return token
+
+            retryable = response.status_code in {429, 500, 502, 503, 504}
+            body = response.text[:500]
+            error = RuntimeError(
+                f"Shopify token request failed ({response.status_code}): {body}"
             )
 
-            response = requests.post(
-                url,
-                json=payload,
-                timeout=REQUEST_TIMEOUT,
-            )
+            if not retryable:
+                raise error
 
-            # ------------------------------------------------
-            # TEMPORARY HTTP ERRORS
-            # ------------------------------------------------
+            last_error = error
+            retry_after = response.headers.get("Retry-After")
+            delay = float(retry_after) if retry_after else RETRY_DELAY * attempt
+            log(f"⚠️ Token request returned {response.status_code}; retrying in {delay:g}s...")
+            time.sleep(delay)
 
-            if response.status_code in (
-                429,
-                500,
-                502,
-                503,
-                504,
-            ):
-
-                if attempt < MAX_RETRIES:
-
-                    retry_after = response.headers.get(
-                        "Retry-After"
-                    )
-
-                    if retry_after:
-                        try:
-                            delay = float(
-                                retry_after
-                            )
-                        except (
-                            ValueError,
-                            TypeError,
-                        ):
-                            delay = (
-                                RETRY_DELAY
-                                * attempt
-                            )
-                    else:
-                        delay = (
-                            RETRY_DELAY
-                            * attempt
-                        )
-
-                    print(
-                        f"⚠️ Shopify token request "
-                        f"returned HTTP "
-                        f"{response.status_code}"
-                    )
-
-                    print(
-                        f"   Retrying in "
-                        f"{delay:.1f}s..."
-                    )
-
-                    time.sleep(delay)
-                    continue
-
-                raise RuntimeError(
-                    "Shopify access token failed "
-                    f"after {MAX_RETRIES} attempts: "
-                    f"HTTP {response.status_code}"
-                )
-
-            # ------------------------------------------------
-            # NON-RETRYABLE ERROR
-            # ------------------------------------------------
-
-            if not response.ok:
-
-                raise RuntimeError(
-                    "Shopify access token failed: "
-                    f"HTTP {response.status_code}: "
-                    f"{response.text[:1000]}"
-                )
-
-            data = response.json()
-
-            token = data.get(
-                "access_token"
-            )
-
-            if not token:
-                raise RuntimeError(
-                    "Shopify token response did not "
-                    f"contain access_token: {data}"
-                )
-
-            expires_in = int(
-                data.get(
-                    "expires_in",
-                    86400,
-                )
-            )
-
-            _token_cache[
-                "access_token"
-            ] = token
-
-            _token_cache[
-                "expires_at"
-            ] = (
-                time.time()
-                + expires_in
-            )
-
-            print(
-                "✅ Shopify access token obtained."
-            )
-
-            return token
-
-        except requests.RequestException as exc:
-
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
             last_error = exc
-
-            if attempt < MAX_RETRIES:
-
-                delay = (
-                    RETRY_DELAY
-                    * attempt
-                )
-
-                print(
-                    f"⚠️ Network error obtaining "
-                    f"Shopify token: {exc}"
-                )
-
-                print(
-                    f"   Retrying in "
-                    f"{delay:.1f}s..."
-                )
-
-                time.sleep(delay)
-
-            else:
+            if attempt >= MAX_RETRIES:
                 break
+            delay = RETRY_DELAY * attempt
+            log(f"⚠️ Token request error: {exc}; retrying in {delay:g}s...")
+            time.sleep(delay)
 
-    raise RuntimeError(
-        "Shopify access token failed after "
-        f"{MAX_RETRIES} attempts: "
-        f"{last_error}"
-    )
+    raise RuntimeError(f"Could not obtain Shopify access token: {last_error}")
 
 
-# ============================================================
-# SHOPIFY GRAPHQL
-# ============================================================
-
-def graphql(
+def graphql_request(
     query: str,
-    variables: Optional[Dict] = None,
-    retry_auth: bool = True,
-) -> Dict:
+    variables: Optional[Dict[str, Any]],
+    token: str,
+) -> Tuple[Dict[str, Any], str]:
+    """Run GraphQL, refreshing the token once if Shopify returns 401."""
+    current_token = token
 
-    url = (
-        f"https://{SHOP_URL}"
-        f"/admin/api/{API_VERSION}"
-        "/graphql.json"
-    )
-
-    last_error = None
-
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1,
-    ):
-
-        token = get_access_token()
-
+    for auth_attempt in range(2):
         headers = {
             "Content-Type": "application/json",
-            "X-Shopify-Access-Token": token,
+            "X-Shopify-Access-Token": current_token,
         }
 
-        try:
+        last_error: Optional[Exception] = None
 
-            response = requests.post(
-                url,
-                headers=headers,
-                json={
-                    "query": query,
-                    "variables": variables or {},
-                },
-                timeout=REQUEST_TIMEOUT,
-            )
-
-            # ------------------------------------------------
-            # TOKEN EXPIRED / INVALID
-            # ------------------------------------------------
-
-            if response.status_code == 401:
-
-                if retry_auth:
-
-                    print(
-                        "⚠️ Shopify returned 401."
-                    )
-
-                    print(
-                        "   Clearing cached token "
-                        "and requesting a new one..."
-                    )
-
-                    _token_cache[
-                        "access_token"
-                    ] = None
-
-                    _token_cache[
-                        "expires_at"
-                    ] = 0
-
-                    return graphql(
-                        query,
-                        variables,
-                        retry_auth=False,
-                    )
-
-                raise RuntimeError(
-                    "Shopify authentication failed "
-                    "after refreshing the token."
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = requests.post(
+                    GRAPHQL_URL,
+                    json={"query": query, "variables": variables or {}},
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT,
                 )
 
-            # ------------------------------------------------
-            # TEMPORARY HTTP ERRORS
-            # ------------------------------------------------
+                if response.status_code == 401 and auth_attempt == 0:
+                    log("🔄 Shopify returned 401; refreshing access token...")
+                    current_token = get_access_token()
+                    break
 
-            if response.status_code in (
-                429,
-                500,
-                502,
-                503,
-                504,
-            ):
-
-                if attempt < MAX_RETRIES:
-
-                    delay = (
-                        RETRY_DELAY
-                        * attempt
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    retry_after = response.headers.get("Retry-After")
+                    delay = float(retry_after) if retry_after else RETRY_DELAY * attempt
+                    log(
+                        f"⚠️ Shopify GraphQL returned {response.status_code}; "
+                        f"retrying in {delay:g}s..."
                     )
-
-                    print(
-                        f"⚠️ Shopify HTTP "
-                        f"{response.status_code}"
-                    )
-
-                    print(
-                        f"   Retrying in "
-                        f"{delay:.1f}s..."
-                    )
-
                     time.sleep(delay)
                     continue
 
-            response.raise_for_status()
+                response.raise_for_status()
+                data = response.json()
 
-            result = response.json()
+                if data.get("errors"):
+                    raise RuntimeError(f"Shopify GraphQL errors: {data['errors']}")
 
-            # ------------------------------------------------
-            # GRAPHQL ERRORS
-            # ------------------------------------------------
+                return data.get("data", {}), current_token
 
-            if result.get("errors"):
-
-                errors = result["errors"]
-
-                # Retry throttling / transient errors.
-                error_text = str(
-                    errors
-                ).lower()
-
-                transient = any(
-                    phrase in error_text
-                    for phrase in (
-                        "throttled",
-                        "timeout",
-                        "temporarily",
-                        "internal",
-                        "service unavailable",
-                    )
-                )
-
-                if (
-                    transient
-                    and attempt < MAX_RETRIES
-                ):
-
-                    delay = (
-                        RETRY_DELAY
-                        * attempt
-                    )
-
-                    print(
-                        f"⚠️ Shopify GraphQL "
-                        f"temporary error"
-                    )
-
-                    print(
-                        f"   Retrying in "
-                        f"{delay:.1f}s..."
-                    )
-
-                    time.sleep(delay)
-                    continue
-
-                raise RuntimeError(
-                    "Shopify GraphQL errors: "
-                    + str(errors)
-                )
-
-            return result.get(
-                "data",
-                {},
-            )
-
-        except requests.RequestException as exc:
-
-            last_error = exc
-
-            if attempt < MAX_RETRIES:
-
-                delay = (
-                    RETRY_DELAY
-                    * attempt
-                )
-
-                print(
-                    f"⚠️ Shopify network error: "
-                    f"{exc}"
-                )
-
-                print(
-                    f"   Retrying in "
-                    f"{delay:.1f}s..."
-                )
-
+            except (requests.RequestException, ValueError, RuntimeError) as exc:
+                last_error = exc
+                if attempt >= MAX_RETRIES:
+                    break
+                delay = RETRY_DELAY * attempt
+                log(f"⚠️ GraphQL request error: {exc}; retrying in {delay:g}s...")
                 time.sleep(delay)
-                continue
+        else:
+            raise RuntimeError(f"Shopify GraphQL request failed: {last_error}")
 
-            break
+        # A 401 caused a token refresh and needs to retry the request.
+        if current_token != headers["X-Shopify-Access-Token"]:
+            continue
 
-    raise RuntimeError(
-        "Shopify GraphQL request failed "
-        f"after {MAX_RETRIES} attempts: "
-        f"{last_error}"
-    )
+        raise RuntimeError(f"Shopify GraphQL request failed: {last_error}")
+
+    raise RuntimeError("Shopify authentication failed after token refresh.")
 
 
-# ============================================================
-# DOWNLOAD SUPPLIER CSV
-# ============================================================
-
+# ---------------------------------------------------------------------------
+# Supplier feed download / format detection
+# ---------------------------------------------------------------------------
 def download_feed() -> bytes:
+    if not XML_URL:
+        raise RuntimeError("XML_URL is not configured.")
 
-    last_error = None
-
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1,
-    ):
-
-        try:
-
-            print(
-                f"📥 Downloading supplier feed "
-                f"(attempt {attempt}/{MAX_RETRIES})..."
-            )
-
-            response = requests.get(
-                XML_URL,
-                timeout=REQUEST_TIMEOUT,
-            )
-
-            response.raise_for_status()
-
-            content = response.content
-
-            if not content:
-                raise RuntimeError(
-                    "Supplier feed is empty."
-                )
-
-            print(
-                f"✅ Feed downloaded "
-                f"({len(content):,} bytes)"
-            )
-
-            return content
-
-        except requests.RequestException as exc:
-
-            last_error = exc
-
-            if attempt < MAX_RETRIES:
-
-                delay = (
-                    RETRY_DELAY
-                    * attempt
-                )
-
-                print(
-                    f"⚠️ Feed download failed: "
-                    f"{exc}"
-                )
-
-                print(
-                    f"   Retrying in "
-                    f"{delay:.1f}s..."
-                )
-
-                time.sleep(delay)
-
-            else:
-                break
-
-    raise RuntimeError(
-        "Supplier feed download failed "
-        f"after {MAX_RETRIES} attempts: "
-        f"{last_error}"
-    )
-
-
-# ============================================================
-# PARSE CSV FEED
-# ============================================================
-
-def parse_feed(
-    content: bytes,
-) -> Set[str]:
-
-    # --------------------------------------------------------
-    # UTF-8 BOM
-    # --------------------------------------------------------
-
-    try:
-        text = content.decode(
-            "utf-8-sig"
-        )
-
-    except UnicodeDecodeError:
-
-        print(
-            "⚠️ Feed is not valid UTF-8."
-        )
-
-        print(
-            "   Trying Windows-1252..."
-        )
-
-        text = content.decode(
-            "cp1252",
-            errors="replace",
-        )
-
-    stream = io.StringIO(
-        text,
-        newline="",
-    )
-
-    reader = csv.DictReader(
-        stream
-    )
-
-    if not reader.fieldnames:
-        raise RuntimeError(
-            "CSV feed has no headers."
-        )
+    last_error: Optional[Exception] = None
 
     headers = {
-        h.strip()
-        for h in reader.fieldnames
-        if h
+        "User-Agent": "Honeylade-Shopify-Cleanup/1.0",
+        "Accept": "text/csv,application/csv,application/xml,text/xml;q=0.9,*/*;q=0.8",
     }
 
-    print(
-        "📋 Feed columns detected:"
-    )
+    for attempt in range(1, MAX_RETRIES + 1):
+        log(f"📥 Downloading supplier feed (attempt {attempt}/{MAX_RETRIES})...")
+        try:
+            response = requests.get(XML_URL, headers=headers, timeout=REQUEST_TIMEOUT)
 
-    print(
-        "   "
-        + ", ".join(
-            sorted(headers)
-        )
-    )
+            if response.status_code == 200:
+                content = response.content
+                log(f"✅ Feed downloaded ({len(content):,} bytes)")
+                return content
 
-    # --------------------------------------------------------
-    # PRODUCT ID IS THE AUTHORITATIVE MATCH KEY
-    # --------------------------------------------------------
+            retryable = response.status_code in {429, 500, 502, 503, 504}
+            error = RuntimeError(
+                f"Feed download failed ({response.status_code}): {response.text[:500]}"
+            )
+            if not retryable:
+                raise error
 
-    product_id_column = None
+            last_error = error
+            retry_after = response.headers.get("Retry-After")
+            delay = float(retry_after) if retry_after else RETRY_DELAY * attempt
+            log(f"⚠️ Feed returned {response.status_code}; retrying in {delay:g}s...")
+            time.sleep(delay)
 
-    for candidate in (
-        "Product ID",
-        "ProductID",
-        "SKU",
-        "Sku",
-        "sku",
-    ):
+        except (requests.RequestException, RuntimeError) as exc:
+            last_error = exc
+            if attempt >= MAX_RETRIES:
+                break
+            delay = RETRY_DELAY * attempt
+            log(f"⚠️ Feed download error: {exc}; retrying in {delay:g}s...")
+            time.sleep(delay)
 
-        if candidate in headers:
-            product_id_column = candidate
-            break
+    raise RuntimeError(f"Could not download supplier feed: {last_error}")
 
-    if not product_id_column:
 
+def detect_feed_format(content: bytes, content_type: str = "") -> str:
+    """Detect XML/CSV without trusting the URL extension or HTTP header."""
+    sample = content.lstrip(b"\xef\xbb\xbf \t\r\n")
+    lowered = sample[:1000].lower()
+    header = content_type.casefold()
+
+    if lowered.startswith(b"<?xml") or lowered.startswith(b"<"):
+        return "xml"
+
+    if "xml" in header:
+        # Only call it XML when the payload actually looks XML-like.
+        if b"<" in sample[:2000]:
+            return "xml"
+
+    if "csv" in header or "spreadsheet" in header:
+        return "csv"
+
+    # Sniff CSV by looking for a header row containing a likely ID column.
+    try:
+        text = content[:100_000].decode("utf-8-sig", errors="replace")
+        first_line = text.splitlines()[0] if text.splitlines() else ""
+        if "," in first_line or "\t" in first_line or ";" in first_line:
+            return "csv"
+    except Exception:
+        pass
+
+    # Final fallback: XML if it parses as XML, otherwise CSV.
+    try:
+        ET.fromstring(content)
+        return "xml"
+    except ET.ParseError:
+        return "csv"
+
+
+# ---------------------------------------------------------------------------
+# CSV parser
+# ---------------------------------------------------------------------------
+CSV_ID_COLUMNS = {
+    "productid",
+    "productsku",
+    "sku",
+    "productcode",
+    "itemcode",
+    "itemid",
+    "stockcode",
+    "stockid",
+    "productnumber",
+    "itemnumber",
+}
+
+
+def find_csv_id_column(fieldnames: Iterable[str]) -> Optional[str]:
+    fields = list(fieldnames)
+    normalised = {normalise_key(f): f for f in fields if f}
+
+    # Exact preferred name first.
+    for candidate in ("productid", "sku", "productsku", "productcode"):
+        if candidate in normalised:
+            return normalised[candidate]
+
+    for key, original in normalised.items():
+        if key in CSV_ID_COLUMNS:
+            return original
+
+    # Conservative fuzzy matching; avoid accidentally using Barcode as SKU.
+    for key, original in normalised.items():
+        if "product" in key and ("id" in key or "sku" in key or "code" in key):
+            return original
+        if key in {"id", "code"}:
+            return original
+
+    return None
+
+
+def parse_csv_feed(content: bytes) -> Set[str]:
+    text = content.decode("utf-8-sig", errors="replace")
+    sample = text[:100_000]
+
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+    except csv.Error:
+        dialect = csv.excel
+
+    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    if not reader.fieldnames:
+        raise RuntimeError("CSV feed has no header row.")
+
+    log("📋 Feed columns detected:")
+    for field in reader.fieldnames:
+        log(f"   {field}")
+
+    id_column = find_csv_id_column(reader.fieldnames)
+    if not id_column:
         raise RuntimeError(
-            "Could not find Product ID/SKU "
-            "column in supplier feed."
+            "Could not find Product ID/SKU column in supplier CSV feed. "
+            f"Columns: {reader.fieldnames}"
         )
 
-    feed_ids = set()
+    log(f"🔑 Supplier identifier column: {id_column}")
 
+    ids: Set[str] = set()
     row_count = 0
 
     for row in reader:
-
         row_count += 1
+        identifier = normalise_identifier(row.get(id_column))
+        if identifier:
+            ids.add(identifier)
 
-        raw_id = row.get(
-            product_id_column,
-            "",
-        )
+    log(f"📦 CSV product rows: {row_count:,}")
+    log(f"🔑 Unique supplier Product IDs: {len(ids):,}")
 
-        if raw_id is None:
+    if not ids:
+        raise RuntimeError("CSV feed contained no usable Product IDs/SKUs.")
+
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# XML parser
+# ---------------------------------------------------------------------------
+XML_ID_NAMES = {
+    "productid",
+    "productsku",
+    "sku",
+    "productcode",
+    "itemcode",
+    "itemid",
+    "stockcode",
+    "stockid",
+    "productnumber",
+    "itemnumber",
+}
+
+XML_RECORD_HINTS = {
+    "product",
+    "item",
+    "record",
+    "productitem",
+    "catalogitem",
+    "productrecord",
+}
+
+
+def iter_xml_elements(root: ET.Element) -> Iterable[ET.Element]:
+    for element in root.iter():
+        yield element
+
+
+def find_xml_identifier(element: ET.Element) -> str:
+    """Find a likely product ID/SKU inside one XML record."""
+    # 1. Attributes, preferring exact names.
+    attributes = {normalise_key(local_name(k)): v for k, v in element.attrib.items()}
+    for candidate in ("productid", "sku", "productsku", "productcode", "itemid", "itemcode"):
+        value = attributes.get(candidate)
+        if value:
+            return normalise_identifier(value)
+
+    # 2. Direct child fields.
+    children = list(element)
+    child_map: Dict[str, ET.Element] = {}
+    for child in children:
+        child_map[normalise_key(local_name(child.tag))] = child
+
+    for candidate in ("productid", "sku", "productsku", "productcode", "itemid", "itemcode"):
+        child = child_map.get(candidate)
+        if child is not None and child.text:
+            value = normalise_identifier(child.text)
+            if value:
+                return value
+
+    # 3. Descendant fields, but only exact identifier names.
+    for descendant in element.iter():
+        if descendant is element:
             continue
+        key = normalise_key(local_name(descendant.tag))
+        if key in XML_ID_NAMES and descendant.text:
+            value = normalise_identifier(descendant.text)
+            if value:
+                return value
 
-        product_id = str(
-            raw_id
-        ).strip()
+    return ""
 
-        if product_id:
-            feed_ids.add(
-                product_id
-            )
 
-    print(
-        f"📊 Feed rows: {row_count:,}"
-    )
-
-    print(
-        f"📊 Unique product IDs: "
-        f"{len(feed_ids):,}"
-    )
-
-    if len(feed_ids) < MIN_FEED_PRODUCTS:
-
+def parse_xml_feed(content: bytes) -> Set[str]:
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as exc:
+        # Provide a useful diagnostic without dumping the whole feed.
+        preview = content[:300].decode("utf-8", errors="replace").replace("\n", " ")
         raise RuntimeError(
-            "SAFETY STOP: Supplier feed contains "
-            f"only {len(feed_ids)} product IDs. "
-            f"Minimum required is "
-            f"{MIN_FEED_PRODUCTS}."
+            f"Supplier feed was detected as XML but could not be parsed: {exc}. "
+            f"Feed begins: {preview!r}"
+        ) from exc
+
+    log(f"📋 XML root element: {local_name(root.tag)}")
+
+    # First identify plausible record elements. We prefer direct/repeated
+    # product/item-like children of the document, then fall back to any
+    # element containing an exact identifier field.
+    records: List[ET.Element] = []
+
+    for child in list(root):
+        if local_name(child.tag) in XML_RECORD_HINTS:
+            records.append(child)
+
+    if not records:
+        for element in root.iter():
+            name = local_name(element.tag)
+            if name in XML_RECORD_HINTS:
+                records.append(element)
+
+    ids: Set[str] = set()
+
+    if records:
+        for record in records:
+            identifier = find_xml_identifier(record)
+            if identifier:
+                ids.add(identifier)
+    else:
+        # Generic fallback for supplier XMLs with unusual record names.
+        for element in root.iter():
+            identifier = find_xml_identifier(element)
+            if identifier:
+                ids.add(identifier)
+
+    if not ids:
+        # Last diagnostic: show the XML field names that look like IDs.
+        candidates: Set[str] = set()
+        for element in root.iter():
+            name = normalise_key(local_name(element.tag))
+            if "sku" in name or ("product" in name and "id" in name) or name in {
+                "itemid",
+                "itemcode",
+                "productcode",
+            }:
+                candidates.add(local_name(element.tag))
+        raise RuntimeError(
+            "Could not find Product ID/SKU values in XML feed. "
+            f"Potential identifier fields found: {sorted(candidates)}"
         )
 
-    return feed_ids
+    log(f"📦 XML product records detected: {len(records):,}")
+    log(f"🔑 Unique supplier Product IDs/SKUs: {len(ids):,}")
+
+    return ids
 
 
-# ============================================================
-# SHOPIFY: GET HONEYLADE PRODUCTS
-# ============================================================
+def parse_supplier_feed(content: bytes) -> Set[str]:
+    """Automatically detect and parse CSV or XML."""
+    feed_format = detect_feed_format(content)
+    log(f"🔎 Supplier feed format detected: {feed_format.upper()}")
 
+    if feed_format == "xml":
+        return parse_xml_feed(content)
+    return parse_csv_feed(content)
+
+
+# ---------------------------------------------------------------------------
+# Shopify product retrieval
+# ---------------------------------------------------------------------------
 PRODUCTS_QUERY = """
-query GetHoneyladeProducts(
-    $first: Int!
-    $after: String
-    $query: String!
-) {
-    products(
-        first: $first
-        after: $after
-        query: $query
-    ) {
+query HoneyladeProducts($cursor: String, $query: String!) {
+  products(first: 250, after: $cursor, query: $query) {
+    nodes {
+      id
+      title
+      handle
+      tags
+      variants(first: 250) {
         nodes {
-            id
-            title
-            handle
-            tags
-
-            variants(first: 100) {
-                nodes {
-                    id
-                    sku
-                }
-            }
+          id
+          sku
+          barcode
         }
-
-        pageInfo {
-            hasNextPage
-            endCursor
-        }
+      }
     }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
 }
 """
 
 
-def get_honeylade_products() -> List[Dict]:
+def has_exact_tag(tags: List[str], wanted: str) -> bool:
+    wanted_norm = wanted.casefold().strip()
+    return any(str(tag).casefold().strip() == wanted_norm for tag in tags)
 
-    products = []
 
-    cursor = None
+def fetch_honeylade_products(token: str) -> Tuple[List[Dict[str, Any]], str]:
+    products: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    page = 0
 
-    search_query = (
-        f'tag:"{HONEYLADE_TAG}"'
-    )
+    # Shopify search query narrows the server-side result set. We also verify
+    # the exact tag locally, so a search parser/escaping quirk cannot broaden
+    # the deletion scope.
+    query_text = f'tag:"{HONEYLADE_TAG.replace(chr(34), chr(92) + chr(34))}"'
 
     while True:
+        page += 1
+        log(f"🔎 Reading Shopify Honeylade products page {page}...")
 
-        data = graphql(
+        data, token = graphql_request(
             PRODUCTS_QUERY,
-            {
-                "first": PAGE_SIZE,
-                "after": cursor,
-                "query": search_query,
-            },
+            {"cursor": cursor, "query": query_text},
+            token,
         )
 
-        connection = data.get(
-            "products"
-        )
-
+        connection = data.get("products")
         if not connection:
-            raise RuntimeError(
-                "Shopify returned no products "
-                "connection."
-            )
+            raise RuntimeError("Shopify did not return a products connection.")
 
-        nodes = connection.get(
-            "nodes",
-            [],
-        )
+        for product in connection.get("nodes", []):
+            tags = product.get("tags") or []
+            if has_exact_tag(tags, HONEYLADE_TAG):
+                products.append(product)
 
-        products.extend(nodes)
-
-        page_info = connection.get(
-            "pageInfo",
-            {},
-        )
-
-        if not page_info.get(
-            "hasNextPage"
-        ):
+        page_info = connection.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
             break
-
-        cursor = page_info.get(
-            "endCursor"
-        )
-
+        cursor = page_info.get("endCursor")
         if not cursor:
-            raise RuntimeError(
-                "Shopify reported another page "
-                "but did not provide a cursor."
-            )
+            raise RuntimeError("Shopify indicated another page but returned no cursor.")
 
-    return products
+    log(f"🏷️ Honeylade-tagged Shopify products found: {len(products):,}")
+    return products, token
 
 
-# ============================================================
-# DELETE PRODUCT
-# ============================================================
-
+# ---------------------------------------------------------------------------
+# Deletion logic
+# ---------------------------------------------------------------------------
 PRODUCT_DELETE_MUTATION = """
-mutation ProductDelete(
-    $input: ProductDeleteInput!
-) {
-    productDelete(
-        input: $input
-        synchronous: true
-    ) {
-        deletedProductId
-
-        userErrors {
-            field
-            message
-        }
+mutation HoneyladeDeleteProduct($input: ProductDeleteInput!) {
+  productDelete(input: $input, synchronous: true) {
+    deletedProductId
+    userErrors {
+      field
+      message
     }
+  }
 }
 """
 
 
-def delete_product(
-    product_id: str,
-) -> None:
+def product_matches_feed(product: Dict[str, Any], supplier_ids: Set[str]) -> bool:
+    """Return true if any Shopify variant identifier still exists in feed."""
+    variants = (product.get("variants") or {}).get("nodes") or []
 
-    data = graphql(
+    for variant in variants:
+        sku = normalise_identifier(variant.get("sku"))
+        if sku and sku in supplier_ids:
+            return True
+
+    return False
+
+
+def describe_product(product: Dict[str, Any]) -> str:
+    variants = (product.get("variants") or {}).get("nodes") or []
+    skus = [normalise_identifier(v.get("sku")) for v in variants]
+    skus = [s for s in skus if s]
+    sku_text = ", ".join(skus[:5]) if skus else "no SKU"
+    if len(skus) > 5:
+        sku_text += f" (+{len(skus) - 5} more)"
+    return f"{product.get('title') or '(untitled)'} | {sku_text} | {product.get('id')}"
+
+
+def delete_product(product: Dict[str, Any], token: str) -> str:
+    data, token = graphql_request(
         PRODUCT_DELETE_MUTATION,
-        {
-            "input": {
-                "id": product_id,
-            }
-        },
+        {"input": {"id": product["id"]}},
+        token,
     )
 
-    payload = data.get(
-        "productDelete"
-    )
-
-    if not payload:
-        raise RuntimeError(
-            "Shopify returned no "
-            "productDelete payload."
-        )
-
-    errors = payload.get(
-        "userErrors",
-        [],
-    )
-
+    payload = data.get("productDelete") or {}
+    errors = payload.get("userErrors") or []
     if errors:
+        raise RuntimeError(f"Shopify productDelete errors: {errors}")
 
-        raise RuntimeError(
-            "Shopify product deletion failed: "
-            + str(errors)
-        )
+    deleted_id = payload.get("deletedProductId")
+    if not deleted_id:
+        raise RuntimeError("Shopify productDelete returned no deletedProductId.")
 
-    deleted_id = payload.get(
-        "deletedProductId"
-    )
-
-    if deleted_id != product_id:
-
-        raise RuntimeError(
-            "Shopify did not confirm deletion "
-            f"of {product_id}."
-        )
+    return token
 
 
-# ============================================================
-# DETERMINE PRODUCTS TO DELETE
-# ============================================================
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def validate_config() -> None:
+    missing = [
+        name
+        for name, value in {
+            "SHOP_URL": SHOP_URL,
+            "XML_URL": XML_URL,
+            "CLIENT_ID": CLIENT_ID,
+            "CLIENT_SECRET": CLIENT_SECRET,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
-def find_products_to_delete(
-    products: List[Dict],
-    feed_ids: Set[str],
-) -> List[Dict]:
+    if not HONEYLADE_TAG:
+        raise RuntimeError("HONEYLADE_TAG cannot be empty.")
 
-    candidates = []
-
-    for product in products:
-
-        product_id = product.get(
-            "id"
-        )
-
-        title = product.get(
-            "title",
-            "",
-        )
-
-        tags = {
-            str(tag).strip().lower()
-            for tag in product.get(
-                "tags",
-                [],
-            )
-        }
-
-        # ----------------------------------------------------
-        # SECONDARY SAFETY CHECK:
-        # Even though the Shopify query uses the tag,
-        # verify the tag ourselves.
-        # ----------------------------------------------------
-
-        if HONEYLADE_TAG.lower() not in tags:
-
-            print(
-                f"⚠️ SKIP {title} "
-                f"({product_id}) - "
-                f"honeylade tag not confirmed."
-            )
-
-            continue
-
-        variants = (
-            product.get(
-                "variants",
-                {},
-            )
-            .get(
-                "nodes",
-                [],
-            )
-        )
-
-        skus = set()
-
-        for variant in variants:
-
-            sku = variant.get(
-                "sku"
-            )
-
-            if sku is not None:
-
-                sku = str(
-                    sku
-                ).strip()
-
-                if sku:
-                    skus.add(
-                        sku
-                    )
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # A product is considered present if ANY of its
-        # variants has a SKU in the current supplier feed.
-        #
-        # Therefore it will only be deleted when NONE of its
-        # SKUs exist in the feed.
-        # ----------------------------------------------------
-
-        matching_skus = (
-            skus.intersection(
-                feed_ids
-            )
-        )
-
-        if matching_skus:
-
-            continue
-
-        candidates.append(
-            {
-                "id": product_id,
-                "title": title,
-                "handle": product.get(
-                    "handle",
-                    "",
-                ),
-                "skus": sorted(
-                    skus
-                ),
-            }
-        )
-
-    return candidates
+    if MIN_FEED_PRODUCTS < 1:
+        raise RuntimeError("MIN_FEED_PRODUCTS must be at least 1.")
+    if MAX_DELETE_PERCENT < 0:
+        raise RuntimeError("MAX_DELETE_PERCENT cannot be negative.")
+    if MAX_DELETE_COUNT < 0:
+        raise RuntimeError("MAX_DELETE_COUNT cannot be negative.")
 
 
-# ============================================================
-# SAFETY CHECK
-# ============================================================
+def main() -> int:
+    log("=" * 70)
+    log("🧹 HONEYLADE SHOPIFY CLEANUP")
+    log("=" * 70)
+    log(f"🏷️ Managed tag: {HONEYLADE_TAG}")
+    log(f"🔧 API version: {API_VERSION}")
+    log(f"🧪 Dry run: {DRY_RUN}")
+    log()
 
-def validate_deletion_count(
-    honeylade_count: int,
-    deletion_count: int,
-) -> None:
+    validate_config()
 
-    if deletion_count == 0:
-        return
-
-    if honeylade_count <= 0:
-        raise RuntimeError(
-            "SAFETY STOP: No Honeylade products "
-            "were found in Shopify."
-        )
-
-    percentage = (
-        deletion_count
-        / honeylade_count
-        * 100
-    )
-
-    print(
-        f"🛡️ Deletion safety check:"
-    )
-
-    print(
-        f"   Honeylade products: "
-        f"{honeylade_count:,}"
-    )
-
-    print(
-        f"   Products to delete: "
-        f"{deletion_count:,}"
-    )
-
-    print(
-        f"   Deletion percentage: "
-        f"{percentage:.2f}%"
-    )
-
-    if (
-        percentage
-        > MAX_DELETE_PERCENT
-    ):
-
-        raise RuntimeError(
-            "SAFETY STOP: This run would delete "
-            f"{percentage:.2f}% of Honeylade products. "
-            f"Maximum allowed is "
-            f"{MAX_DELETE_PERCENT:.2f}%."
-        )
-
-    if (
-        MAX_DELETE_COUNT > 0
-        and deletion_count
-        > MAX_DELETE_COUNT
-    ):
-
-        raise RuntimeError(
-            "SAFETY STOP: This run would delete "
-            f"{deletion_count:,} products. "
-            f"Maximum allowed is "
-            f"{MAX_DELETE_COUNT:,}."
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main() -> None:
-
-    print("=" * 70)
-    print("🧹 HONEYLADE SHOPIFY CLEANUP")
-    print("=" * 70)
-
-    print(
-        f"🏷️ Managed tag: {HONEYLADE_TAG}"
-    )
-
-    print(
-        f"🔧 API version: {API_VERSION}"
-    )
-
-    print(
-        f"🧪 Dry run: {DRY_RUN}"
-    )
-
-    print()
-
-    require_environment()
-
-    # --------------------------------------------------------
-    # AUTHENTICATE
-    # --------------------------------------------------------
-
-    get_access_token()
-
-    print(
-        "🔐 Shopify authentication: OK"
-    )
-
-    print()
-
-    # --------------------------------------------------------
-    # DOWNLOAD FEED
-    # --------------------------------------------------------
+    token = get_access_token()
+    log("🔐 Shopify authentication: OK")
+    log()
 
     feed_content = download_feed()
+    supplier_ids = parse_supplier_feed(feed_content)
 
-    print()
-
-    # --------------------------------------------------------
-    # PARSE FEED
-    # --------------------------------------------------------
-
-    feed_ids = parse_feed(
-        feed_content
-    )
-
-    print()
-
-    # --------------------------------------------------------
-    # GET SHOPIFY HONEYLADE PRODUCTS
-    # --------------------------------------------------------
-
-    print(
-        f"🔎 Finding Shopify products "
-        f"tagged '{HONEYLADE_TAG}'..."
-    )
-
-    products = (
-        get_honeylade_products()
-    )
-
-    print(
-        f"📦 Honeylade products found: "
-        f"{len(products):,}"
-    )
-
-    print()
-
-    # --------------------------------------------------------
-    # FIND REMOVED PRODUCTS
-    # --------------------------------------------------------
-
-    to_delete = (
-        find_products_to_delete(
-            products,
-            feed_ids,
-        )
-    )
-
-    print(
-        f"🗑️ Products no longer in feed: "
-        f"{len(to_delete):,}"
-    )
-
-    print()
-
-    # --------------------------------------------------------
-    # SAFETY CHECK
-    # --------------------------------------------------------
-
-    validate_deletion_count(
-        len(products),
-        len(to_delete),
-    )
-
-    # --------------------------------------------------------
-    # NOTHING TO DELETE
-    # --------------------------------------------------------
-
-    if not to_delete:
-
-        print(
-            "✅ Nothing to remove."
+    if len(supplier_ids) < MIN_FEED_PRODUCTS:
+        raise RuntimeError(
+            f"Safety stop: supplier feed contains only {len(supplier_ids):,} unique "
+            f"Product IDs, below MIN_FEED_PRODUCTS={MIN_FEED_PRODUCTS:,}. "
+            "No Shopify products will be deleted."
         )
 
-        print("=" * 70)
+    log(f"🛡️ Feed safety check passed: {len(supplier_ids):,} products")
+    log()
 
-        return
+    products, token = fetch_honeylade_products(token)
 
-    # --------------------------------------------------------
-    # SHOW CANDIDATES
-    # --------------------------------------------------------
+    if not products:
+        log("ℹ️ No Shopify products with the managed Honeylade tag were found.")
+        log("✅ CLEANUP COMPLETE")
+        return 0
 
-    print(
-        "Products identified for deletion:"
-    )
+    stale_products = [
+        product
+        for product in products
+        if not product_matches_feed(product, supplier_ids)
+    ]
 
-    print()
+    stale_count = len(stale_products)
+    managed_count = len(products)
+    stale_percent = (stale_count / managed_count * 100) if managed_count else 0.0
 
-    for index, product in enumerate(
-        to_delete,
-        1,
-    ):
+    log(f"📊 Managed Shopify products: {managed_count:,}")
+    log(f"📊 Products still present in feed: {managed_count - stale_count:,}")
+    log(f"🗑️ Products no longer in feed: {stale_count:,} ({stale_percent:.2f}%)")
+    log()
 
-        print(
-            f"{index:>5}. "
-            f"{product['title']}"
+    if stale_count == 0:
+        log("✅ Nothing to remove. All Honeylade-tagged products still exist in the feed.")
+        log("✅ CLEANUP COMPLETE")
+        return 0
+
+    if stale_count > MAX_DELETE_COUNT:
+        raise RuntimeError(
+            f"Safety stop: {stale_count:,} products would be deleted, exceeding "
+            f"MAX_DELETE_COUNT={MAX_DELETE_COUNT:,}. No deletions performed."
         )
 
-        print(
-            f"       ID: "
-            f"{product['id']}"
+    if stale_percent > MAX_DELETE_PERCENT:
+        raise RuntimeError(
+            f"Safety stop: {stale_percent:.2f}% of Honeylade-tagged products would be "
+            f"deleted, exceeding MAX_DELETE_PERCENT={MAX_DELETE_PERCENT:.2f}%. "
+            "No deletions performed."
         )
 
-        print(
-            f"       SKU(s): "
-            f"{', '.join(product['skus']) or '(none)'}"
-        )
-
-        print(
-            f"       Handle: "
-            f"{product['handle']}"
-        )
-
-    print()
-
-    # --------------------------------------------------------
-    # DRY RUN
-    # --------------------------------------------------------
+    log("🗑️ Products selected for removal:")
+    for product in stale_products:
+        log(f"   - {describe_product(product)}")
+    log()
 
     if DRY_RUN:
+        log("🧪 DRY RUN enabled — NO PRODUCTS WERE DELETED.")
+        log("➡️ Set DRY_RUN=false only after reviewing the list above.")
+        log("✅ CLEANUP COMPLETE (DRY RUN)")
+        return 0
 
-        print(
-            "🧪 DRY RUN ENABLED"
-        )
-
-        print(
-            "   No products were deleted."
-        )
-
-        print()
-
-        print(
-            "   To actually delete them, "
-            "set:"
-        )
-
-        print(
-            "   DRY_RUN=false"
-        )
-
-        print("=" * 70)
-
-        return
-
-    # --------------------------------------------------------
-    # CONFIRM REAL DELETION
-    # --------------------------------------------------------
-
-    print(
-        "⚠️ REAL DELETION MODE"
-    )
-
-    print(
-        f"⚠️ {len(to_delete):,} Shopify "
-        "products will be permanently deleted."
-    )
-
-    print()
-
-    # --------------------------------------------------------
-    # DELETE
-    # --------------------------------------------------------
+    log("⚠️ DRY_RUN=false — permanent Shopify product deletion is starting.")
 
     deleted = 0
     failed = 0
 
-    for index, product in enumerate(
-        to_delete,
-        1,
-    ):
-
-        product_id = product[
-            "id"
-        ]
-
-        title = product[
-            "title"
-        ]
-
-        print(
-            f"[{index}/{len(to_delete)}] "
-            f"🗑️ Deleting {title}"
-        )
-
-        print(
-            f"      ID: {product_id}"
-        )
-
+    for product in stale_products:
+        description = describe_product(product)
+        log(f"🗑️ Deleting: {description}")
         try:
-
-            delete_product(
-                product_id
-            )
-
+            token = delete_product(product, token)
             deleted += 1
-
-            print(
-                "      ✅ Deleted"
-            )
-
+            log("   ✅ Deleted")
         except Exception as exc:
-
             failed += 1
+            log(f"   ❌ Delete failed: {exc}")
 
-            print(
-                f"      ❌ FAILED: {exc}"
-            )
-
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
-
-    print()
-    print("=" * 70)
-    print("🧹 CLEANUP COMPLETE")
-    print("=" * 70)
-
-    print(
-        f"📊 Honeylade products checked: "
-        f"{len(products):,}"
-    )
-
-    print(
-        f"📊 Feed product IDs: "
-        f"{len(feed_ids):,}"
-    )
-
-    print(
-        f"🗑️ Products deleted: "
-        f"{deleted:,}"
-    )
-
-    print(
-        f"❌ Failed deletions: "
-        f"{failed:,}"
-    )
-
-    print("=" * 70)
+    log()
+    log("=" * 70)
+    log("🧹 CLEANUP SUMMARY")
+    log("=" * 70)
+    log(f"🏷️ Honeylade-tagged products checked: {managed_count:,}")
+    log(f"🗑️ Products selected: {stale_count:,}")
+    log(f"✅ Successfully deleted: {deleted:,}")
+    log(f"❌ Failed deletions: {failed:,}")
 
     if failed:
-        sys.exit(1)
+        log("❌ CLEANUP FINISHED WITH ERRORS")
+        return 1
+
+    log("✅ CLEANUP COMPLETE")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
-
+        raise SystemExit(main())
     except KeyboardInterrupt:
-
-        print()
-        print(
-            "⚠️ Cleanup interrupted."
-        )
-
-        sys.exit(130)
-
+        log("\n❌ CLEANUP INTERRUPTED")
+        raise SystemExit(130)
     except Exception as exc:
-
-        print()
-        print(
-            f"❌ CLEANUP STOPPED: {exc}"
-        )
-
-        sys.exit(1)
+        log()
+        log(f"❌ CLEANUP STOPPED: {exc}")
+        raise SystemExit(1)
