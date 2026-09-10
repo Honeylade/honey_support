@@ -1,0 +1,46 @@
+name: honeylade cleanup
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests
+
+      - name: Run Honeylade cleanup
+        env:
+          SHOP_URL: ${{ secrets.SHOP_URL }}
+          XML_URL: ${{ secrets.XML_URL }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+
+          API_VERSION: '2026-07'
+
+          HONEYLADE_TAG: 'honeylade'
+
+          MAX_RETRIES: '6'
+          RETRY_DELAY: '5'
+          REQUEST_TIMEOUT: '60'
+
+          # FIRST RUN: keep true
+          DRY_RUN: 'true'
+
+          MIN_FEED_PRODUCTS: '100'
+          MAX_DELETE_PERCENT: '25'
+          MAX_DELETE_COUNT: '100'
+        run: |
+          python honeylade_cleanup.py
