@@ -1,6 +1,11 @@
 name: cleanhoney
 
 on:
+  schedule:
+    # Runs daily at 02:00 UTC
+    - cron: "0 2 * * *"
+
+  # Allows manual runs from GitHub Actions
   workflow_dispatch:
 
 jobs:
