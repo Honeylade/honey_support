@@ -30,7 +30,17 @@ import requests
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SHOP_URL = os.environ.get("SHOP_URL", "").strip().rstrip("/")
+def normalise_shop_url(value: str) -> str:
+    """Return Shopify shop URL with a valid HTTP(S) scheme."""
+    value = value.strip().strip("\"'")
+    if not value:
+        return ""
+    if not re.match(r"^https?://", value, flags=re.IGNORECASE):
+        value = "https://" + value
+    return value.rstrip("/")
+
+
+SHOP_URL = normalise_shop_url(os.environ.get("SHOP_URL", ""))
 XML_URL = os.environ.get("XML_URL", "").strip()
 CLIENT_ID = os.environ.get("CLIENT_ID", "").strip()
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "").strip()
