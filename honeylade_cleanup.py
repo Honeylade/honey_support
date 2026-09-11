@@ -668,13 +668,36 @@ def product_matches_feed(product: Dict[str, Any], supplier_ids: Set[str]) -> boo
 
 
 def describe_product(product: Dict[str, Any]) -> str:
+    """Return a compact one-line description for normal deletion logging."""
     variants = (product.get("variants") or {}).get("nodes") or []
     skus = [normalise_identifier(v.get("sku")) for v in variants]
     skus = [s for s in skus if s]
-    sku_text = ", ".join(skus[:5]) if skus else "no SKU"
-    if len(skus) > 5:
-        sku_text += f" (+{len(skus) - 5} more)"
+    sku_text = ", ".join(skus) if skus else "no SKU"
     return f"{product.get('title') or '(untitled)'} | {sku_text} | {product.get('id')}"
+
+
+def print_stale_products(stale_products: List[Dict[str, Any]]) -> None:
+    """Print every stale product and every variant SKU before any safety stop."""
+    log("📋 PRODUCTS THAT WOULD BE DELETED:")
+    log("=" * 70)
+
+    for index, product in enumerate(stale_products, start=1):
+        variants = (product.get("variants") or {}).get("nodes") or []
+        log(f"{index}. {product.get('title') or '(untitled)'}")
+        log(f"   Product ID: {product.get('id') or '(unknown)'}")
+        log(f"   Handle: {product.get('handle') or '(none)'}")
+
+        if variants:
+            log("   Variant SKUs:")
+            for variant in variants:
+                sku = normalise_identifier(variant.get("sku"))
+                log(f"      - {sku if sku else '(no SKU)'}")
+        else:
+            log("   Variant SKUs: (no variants returned)")
+
+        log()
+
+    log("=" * 70)
 
 
 def delete_product(product: Dict[str, Any], token: str) -> str:
@@ -779,6 +802,10 @@ def main() -> int:
         log("✅ CLEANUP COMPLETE")
         return 0
 
+    # Always print the complete stale-product list before either safety stop.
+    # This is informational only; nothing is deleted by this function.
+    print_stale_products(stale_products)
+
     if stale_count > MAX_DELETE_COUNT:
         raise RuntimeError(
             f"Safety stop: {stale_count:,} products would be deleted, exceeding "
@@ -791,11 +818,6 @@ def main() -> int:
             f"deleted, exceeding MAX_DELETE_PERCENT={MAX_DELETE_PERCENT:.2f}%. "
             "No deletions performed."
         )
-
-    log("🗑️ Products selected for removal:")
-    for product in stale_products:
-        log(f"   - {describe_product(product)}")
-    log()
 
     if DRY_RUN:
         log("🧪 DRY RUN enabled — NO PRODUCTS WERE DELETED.")
