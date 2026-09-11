@@ -2,8 +2,8 @@ name: cleanhoney
 
 on:
   schedule:
-    # Runs daily at 02:00 UTC
-    - cron: "0 2 * * *"
+    # # 08:00 UK time during winter (GMT)
+    - cron: "0 8 * * *"
 
   # Allows manual runs from GitHub Actions
   workflow_dispatch:
