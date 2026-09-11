@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-Honeylade Shopify Cleanup
-
 Removes Shopify products that are managed by the Honeylade tag but whose
 supplier Product ID/SKU no longer exists in the current supplier feed.
 
