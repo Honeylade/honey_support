@@ -1,4 +1,4 @@
-name: honeylade cleanup
+name: cleanhoney
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests
 
-      - name: Run Honeylade cleanup
+      - name: Run cleanhoney
         env:
           SHOP_URL: ${{ secrets.SHOP_URL }}
           XML_URL: ${{ secrets.XML_URL }}
@@ -43,4 +43,4 @@ jobs:
           MAX_DELETE_PERCENT: '25'
           MAX_DELETE_COUNT: '200'
         run: |
-          python honeylade_cleanup.py
+          python cleaner.py
