@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import time
+import threading
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -30,17 +31,7 @@ import requests
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-def normalise_shop_url(value: str) -> str:
-    """Return Shopify shop URL with a valid HTTP(S) scheme."""
-    value = value.strip().strip("\"'")
-    if not value:
-        return ""
-    if not re.match(r"^https?://", value, flags=re.IGNORECASE):
-        value = "https://" + value
-    return value.rstrip("/")
-
-
-SHOP_URL = normalise_shop_url(os.environ.get("SHOP_URL", ""))
+SHOP_URL = os.environ.get("SHOP_URL", "").strip().rstrip("/")
 XML_URL = os.environ.get("XML_URL", "").strip()
 CLIENT_ID = os.environ.get("CLIENT_ID", "").strip()
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "").strip()
@@ -103,58 +94,103 @@ def normalise_key(value: str) -> str:
 # ---------------------------------------------------------------------------
 # Shopify authentication / HTTP
 # ---------------------------------------------------------------------------
+_token_cache = {
+    "access_token": None,
+    "expires_at": 0,
+}
+
+_token_lock = threading.Lock()
+
+
 def get_access_token() -> str:
-    if not SHOP_URL or not CLIENT_ID or not CLIENT_SECRET:
-        raise RuntimeError(
-            "SHOP_URL, CLIENT_ID and CLIENT_SECRET must be configured."
-        )
+    """
+    Get a Shopify client-credentials access token using the same mechanism
+    as the working Honeylade sync script, and cache it until shortly before
+    expiry.
+    """
+    with _token_lock:
+        if (
+            _token_cache["access_token"]
+            and time.time() < _token_cache["expires_at"] - 60
+        ):
+            return _token_cache["access_token"]
 
-    url = f"{SHOP_URL}/admin/oauth/access_tokens"
-    payload = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "client_credentials",
-    }
+        if not SHOP_URL:
+            raise RuntimeError("SHOP_URL is not configured.")
+        if not CLIENT_ID:
+            raise RuntimeError("CLIENT_ID is not configured.")
+        if not CLIENT_SECRET:
+            raise RuntimeError("CLIENT_SECRET is not configured.")
 
-    last_error: Optional[Exception] = None
+        # IMPORTANT: this intentionally matches the working sync script:
+        #   https://{SHOP_URL}/admin/oauth/access_token
+        #   POST JSON body containing client_id/client_secret/grant_type
+        # SHOP_URL is expected to be the bare myshopify.com hostname.
+        url = f"https://{SHOP_URL}/admin/oauth/access_token"
+        data = {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "client_credentials",
+        }
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        log(f"🔐 Requesting Shopify access token (attempt {attempt}/{MAX_RETRIES})...")
+        log("🔐 Requesting Shopify access token...")
+
         try:
-            response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+            response = requests.post(
+                url,
+                json=data,
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Shopify token request failed: {exc}") from exc
 
-            if response.status_code == 200:
-                data = response.json()
-                token = data.get("access_token")
-                if not token:
-                    raise RuntimeError("Shopify response did not contain access_token.")
-                log("✅ Shopify access token obtained.")
-                return token
+        if not response.ok:
+            # Do not retry 400/401/403 here. These normally indicate a
+            # configuration/authentication problem rather than a transient
+            # Shopify failure. Retryable HTTP failures are handled explicitly
+            # below for 429/5xx.
+            if response.status_code in {429, 500, 502, 503, 504}:
+                retry_after = response.headers.get("Retry-After")
+                detail = response.text[:1000]
+                raise RuntimeError(
+                    f"Shopify token request returned retryable HTTP "
+                    f"{response.status_code}: {detail}"
+                )
 
-            retryable = response.status_code in {429, 500, 502, 503, 504}
-            body = response.text[:500]
-            error = RuntimeError(
-                f"Shopify token request failed ({response.status_code}): {body}"
+            raise RuntimeError(
+                f"Shopify token request failed: HTTP {response.status_code}: "
+                f"{response.text[:1000]}"
             )
 
-            if not retryable:
-                raise error
+        try:
+            token_data = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                "Shopify token response was not valid JSON: "
+                f"{response.text[:1000]}"
+            ) from exc
 
-            last_error = error
-            retry_after = response.headers.get("Retry-After")
-            delay = float(retry_after) if retry_after else RETRY_DELAY * attempt
-            log(f"⚠️ Token request returned {response.status_code}; retrying in {delay:g}s...")
-            time.sleep(delay)
+        token = token_data.get("access_token")
+        if not token:
+            raise RuntimeError(
+                "Shopify token response did not contain access_token: "
+                f"{token_data}"
+            )
 
-        except (requests.RequestException, ValueError, RuntimeError) as exc:
-            last_error = exc
-            if attempt >= MAX_RETRIES:
-                break
-            delay = RETRY_DELAY * attempt
-            log(f"⚠️ Token request error: {exc}; retrying in {delay:g}s...")
-            time.sleep(delay)
+        expires_in = int(token_data.get("expires_in", 86400))
+        _token_cache["access_token"] = token
+        _token_cache["expires_at"] = time.time() + expires_in
 
-    raise RuntimeError(f"Could not obtain Shopify access token: {last_error}")
+        log("✅ Shopify access token obtained.")
+        return token
+
+
+def refresh_access_token() -> str:
+    """Clear the cached token and obtain a fresh one."""
+    with _token_lock:
+        _token_cache["access_token"] = None
+        _token_cache["expires_at"] = 0
+    return get_access_token()
 
 
 def graphql_request(
@@ -184,7 +220,7 @@ def graphql_request(
 
                 if response.status_code == 401 and auth_attempt == 0:
                     log("🔄 Shopify returned 401; refreshing access token...")
-                    current_token = get_access_token()
+                    current_token = refresh_access_token()
                     break
 
                 if response.status_code in {429, 500, 502, 503, 504}:
