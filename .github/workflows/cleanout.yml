@@ -36,11 +36,11 @@ jobs:
           RETRY_DELAY: '5'
           REQUEST_TIMEOUT: '60'
 
-          # FIRST RUN: keep true
-          DRY_RUN: 'true'
+          # FIRST RUN: keep TRUE for dry run, and FALSE to delete
+          DRY_RUN: 'false'
 
           MIN_FEED_PRODUCTS: '100'
           MAX_DELETE_PERCENT: '25'
-          MAX_DELETE_COUNT: '100'
+          MAX_DELETE_COUNT: '200'
         run: |
           python honeylade_cleanup.py
