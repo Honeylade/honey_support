@@ -50,7 +50,7 @@ MIN_FEED_PRODUCTS = int(os.environ.get("MIN_FEED_PRODUCTS", "100"))
 MAX_DELETE_PERCENT = float(os.environ.get("MAX_DELETE_PERCENT", "25"))
 MAX_DELETE_COUNT = int(os.environ.get("MAX_DELETE_COUNT", "100"))
 
-GRAPHQL_URL = f"{SHOP_URL}/admin/api/{API_VERSION}/graphql.json"
+GRAPHQL_URL = f"https://{SHOP_URL}/admin/api/{API_VERSION}/graphql.json"
 
 
 # ---------------------------------------------------------------------------
