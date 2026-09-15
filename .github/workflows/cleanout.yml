@@ -2,17 +2,7 @@ name: cleanhoney
 
 on:
   schedule:
-    # 06:00 UTC
-    - cron: "0 6 * * *"
-
-    # 08:00 UTC
-    - cron: "0 8 * * *"
-
-    # 10:00 UTC
-    - cron: "0 10 * * *"
-
-    # 12:00 UTC
-    - cron: "0 12 * * *"
+    - cron: '45 */2 * * *' # every 2 hours at :45
   # Allows manual runs from GitHub Actions
   workflow_dispatch:
 
