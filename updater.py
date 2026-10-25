@@ -210,7 +210,7 @@ def calc_price(cost, weight):
     else:
         margin = 0.20
 
-    TAX = 0.20
+    TAX = 0.00 # 0.20 Tax removed
     FEES = 0.029 + 0.09
     FIXED_COSTS = 0.30 + 0.50
 
